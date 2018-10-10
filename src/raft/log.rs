@@ -13,7 +13,7 @@ impl<Record> MemoryLog<Record> {
 }
 
 impl<Record> Log<Record> for MemoryLog<Record> {
-    fn get_current_term (&mut self) -> u64 {
+    fn get_current_term (&self) -> u64 {
         self.term
     }
 
@@ -21,7 +21,7 @@ impl<Record> Log<Record> for MemoryLog<Record> {
         self.term = term;
     }
 
-    fn get_voted_for (&mut self) -> &Option<String> {
+    fn get_voted_for (&self) -> &Option<String> {
         &self.voted_for
     }
 
@@ -29,11 +29,11 @@ impl<Record> Log<Record> for MemoryLog<Record> {
         self.voted_for = candidate
     }
 
-    fn get_index (&mut self) -> u64 {
+    fn get_index (&self) -> u64 {
         self.records.len() as u64
     }
 
-    fn get_entry (&mut self, index: u64) -> &(u64, Box<Record>) {
+    fn get_entry (&self, index: u64) -> &(u64, Box<Record>) {
         &self.records[index as usize]
     }
 

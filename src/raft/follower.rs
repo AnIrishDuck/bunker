@@ -48,6 +48,13 @@ mod tests {
 
     extern crate env_logger;
 
+    fn cluster () -> Cluster {
+        Cluster {
+            id: "me".to_string(),
+            peers: vec!["other".to_string()]
+        }
+    }
+
     fn boxed(raw: Vec<(u64, u64)>) -> Vec<(u64, Box<u64>)> {
         raw.iter().map(|(t, v)| (*t, Box::new(*v))).collect()
     }
@@ -62,7 +69,7 @@ mod tests {
         let mut log: MemoryLog<u64> = MemoryLog::new();
         let link: NullLink = NullLink::new();
         {
-            let mut raft: Raft<u64> = Raft::new(&mut log, &link);
+            let mut raft: Raft<u64> = Raft::new(cluster(), &DEFAULT_CONFIG, &mut log, &link);
 
             let response = raft.append_entries(AppendEntries {
                 term: 0,
@@ -96,7 +103,7 @@ mod tests {
         let mut log: MemoryLog<u64> = MemoryLog::new();
         let link: NullLink = NullLink::new();
         {
-            let mut raft: Raft<u64> = Raft::new(&mut log, &link);
+            let mut raft: Raft<u64> = Raft::new(cluster(), &DEFAULT_CONFIG, &mut log, &link);
 
             let response = raft.append_entries(AppendEntries {
                 term: 0,

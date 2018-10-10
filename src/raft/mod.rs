@@ -1,19 +1,21 @@
+use futures::{future, Future};
 use std::cmp::min;
-use std::fmt::Debug;
+use std::fmt::{Debug};
 
 mod follower;
+mod candidate;
 mod log;
 
 /* prelude: definitions from page 4 of the raft paper */
 pub trait Log<Record> {
-    fn get_current_term (&mut self) -> u64;
+    fn get_current_term (&self) -> u64;
     fn set_current_term (&mut self, term: u64);
 
-    fn get_voted_for (&mut self) -> &Option<String>;
+    fn get_voted_for (&self) -> &Option<String>;
     fn set_voted_for (&mut self, candidate: Option<String>);
 
-    fn get_index (&mut self) -> u64;
-    fn get_entry (&mut self, index: u64) -> &(u64, Box<Record>);
+    fn get_index (&self) -> u64;
+    fn get_entry (&self, index: u64) -> &(u64, Box<Record>);
     fn insert (&mut self, index: u64, records: Vec<(u64, Box<Record>)>);
 }
 
@@ -21,12 +23,18 @@ pub trait StateMachine<Record> {
     fn apply (record: Box<Record>) -> bool;
 }
 
-pub struct VolatileState {
+pub struct VolatileState<'a> {
     commit_index: u64,
     // we will track last_applied in the state machine
+    candidate: candidate::State<'a>
 }
 
-#[derive(Debug)]
+pub struct Cluster {
+    id: String,
+    peers: Vec<String>
+}
+
+#[derive(Debug, Clone)]
 pub struct LogEntry {
     index: u64,
     term: u64
@@ -59,31 +67,46 @@ pub struct Vote {
     vote_granted: bool
 }
 
-pub trait Link<Record> {
-    fn append_entries(&self,id: String, request: AppendEntries<Record>) -> Append;
+type VoteResponse = Future<Item=Vote, Error=String>;
 
-    fn request_vote(&self, id: String, request: RequestVote) -> Vote;
+pub trait Link<Record> {
+    fn append_entries(&self,id: &String, request: AppendEntries<Record>) -> Append;
+
+    fn request_vote (&self, id: &String, request: RequestVote) -> Box<VoteResponse>;
 }
 
-pub enum State { Follower, Candidate, Leader }
+pub enum Role { Follower, Candidate, Leader }
+
+pub struct Config {
+    election_restart_ticks: usize
+}
+
+static DEFAULT_CONFIG: Config = Config {
+    election_restart_ticks: 10
+};
 
 pub struct Raft<'a, Record: 'a> {
-    volatile_state: VolatileState,
+    config: &'a Config,
+    cluster: Cluster,
+    volatile_state: VolatileState<'a>,
     log: &'a mut Log<Record>,
     link: &'a Link<Record>,
-    state: State
+    role: Role
 }
 
 impl<'a, Record: Debug + 'a> Raft<'a, Record> {
-    pub fn new (log: &'a mut Log<Record>, link: &'a Link<Record>) -> Self {
+    pub fn new (cluster: Cluster, config: &'a Config, log: &'a mut Log<Record>, link: &'a Link<Record>) -> Self {
         let volatile = VolatileState {
+            candidate: candidate::State::new(),
             commit_index: 0
         };
 
         Raft {
+            config: config,
+            cluster: cluster,
             link: link,
             log: log,
-            state: State::Follower,
+            role: Role::Follower,
             volatile_state: volatile
         }
     }
@@ -97,8 +120,8 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
             request.previous_entry,
         );
 
-        let success = match self.state {
-            State::Follower => follower::append_entries(self, request),
+        let success = match self.role {
+            Role::Follower => follower::append_entries(self, request),
             _ => false
         };
         let response = Append { term: current_term, success: success };
@@ -111,7 +134,6 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         let current_term = self.log.get_current_term();
 
         debug!("RX: {:?}", request);
-
         let vote_granted = if request.term < current_term { false } else {
             let prior_vote = {
                 let voted_for = self.log.get_voted_for();
@@ -144,7 +166,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         response
     }
 
-    fn get_last_log_entry (&mut self) -> LogEntry {
+    fn get_last_log_entry<'b> (&'b mut self) -> LogEntry {
         let index = self.log.get_index();
         let term = if index == 0 { 0 } else {
             let (last, _record) = self.log.get_entry(index - 1);
@@ -164,12 +186,12 @@ impl NullLink {
 }
 
 impl<Record> Link<Record> for NullLink {
-    fn append_entries(&self, _id: String, _request: AppendEntries<Record>) -> Append {
+    fn append_entries(&self, _id: &String, _request: AppendEntries<Record>) -> Append {
         Append { term: 0, success: false }
     }
 
-    fn request_vote(&self, _id: String, _request: RequestVote) -> Vote {
-        Vote { term: 0, vote_granted: false }
+    fn request_vote (&self, _id: &String, _request: RequestVote) -> Box<VoteResponse> {
+        Box::new(future::ok(Vote { term: 0, vote_granted: false }))
     }
 }
 
@@ -180,13 +202,20 @@ mod tests {
 
     extern crate env_logger;
 
+    fn cluster () -> Cluster {
+        Cluster {
+            id: "me".to_string(),
+            peers: vec!["other".to_string()]
+        }
+    }
+
     #[test]
     fn vote_granted () {
         let _ = env_logger::try_init();
         let mut log: MemoryLog<u64> = MemoryLog::new();
         let link = NullLink::new();
         {
-            let mut raft: Raft<u64> = Raft::new(&mut log, &link);
+            let mut raft: Raft<u64> = Raft::new(cluster(), &DEFAULT_CONFIG, &mut log, &link);
             let response = raft.request_vote(RequestVote {
                 term: 0,
                 candidate_id: "george michael".to_string(),

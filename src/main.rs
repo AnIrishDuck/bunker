@@ -1,6 +1,10 @@
-#![feature(plugin)]
-#![plugin(rocket_codegen)]
+#[macro_use]
+extern crate log;
+extern crate env_logger;
+extern crate tokio;
+extern crate futures;
 
+mod raft;
 extern crate rocket;
 extern crate rocksdb;
 
