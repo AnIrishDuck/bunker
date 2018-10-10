@@ -1,0 +1,44 @@
+use raft::Log;
+
+pub struct MemoryLog<Record> {
+    pub term: u64,
+    pub voted_for: Option<String>,
+    pub records: Vec<(u64, Box<Record>)>
+}
+
+impl<Record> MemoryLog<Record> {
+    pub fn new () -> Self {
+        MemoryLog { term: 0, voted_for: None, records: vec![] }
+    }
+}
+
+impl<Record> Log<Record> for MemoryLog<Record> {
+    fn get_current_term (&mut self) -> u64 {
+        self.term
+    }
+
+    fn set_current_term (&mut self, term: u64) {
+        self.term = term;
+    }
+
+    fn get_voted_for (&mut self) -> &Option<String> {
+        &self.voted_for
+    }
+
+    fn set_voted_for (&mut self, candidate: Option<String>) {
+        self.voted_for = candidate
+    }
+
+    fn get_index (&mut self) -> u64 {
+        self.records.len() as u64
+    }
+
+    fn get_entry (&mut self, index: u64) -> &(u64, Box<Record>) {
+        &self.records[index as usize]
+    }
+
+    fn insert (&mut self, index: u64, records: Vec<(u64, Box<Record>)>) {
+        self.records.truncate(index as usize);
+        self.records.extend(records);
+    }
+}
