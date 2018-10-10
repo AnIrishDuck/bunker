@@ -1,0 +1,11 @@
+[package]
+name = "bunker"
+version = "0.1.0"
+authors = ["Frank Murphy <fmurphy@instructure.com>"]
+
+[dependencies]
+env_logger = "0.5.13"
+log = "0.4"
+rocksdb = "0.10.1"
+gotham = "0.2.1"
+gotham_derive = "0.2.1"

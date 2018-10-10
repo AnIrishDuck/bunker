@@ -23,6 +23,7 @@ pub struct VolatileState {
     // we will track last_applied in the state machine
 }
 
+#[derive(Debug)]
 pub struct LogEntry {
     index: u64,
     term: u64
@@ -36,17 +37,20 @@ pub struct AppendEntries<Record> {
     leader_commit: u64
 }
 
+#[derive(Debug)]
 pub struct Append {
     term: u64,
     success: bool
 }
 
+#[derive(Debug)]
 pub struct RequestVote {
     term: u64,
     candidate_id: String,
     last_log: LogEntry
 }
 
+#[derive(Debug)]
 pub struct Vote {
     term: u64,
     vote_granted: bool
@@ -77,9 +81,13 @@ impl<'a, Record: Debug> Raft<'a, Record> {
 
         let request_from_prior_term = request.term < current_term;
         let prior_index = request.previous_entry.index;
+        let count = request.entries.len() as u64;
 
-        println!("append {} {}", request.previous_entry.term, request.previous_entry.index);
-        println!("{} {}", self.log.get_index(), prior_index);
+        debug!(
+            "RX AppendEntries: {} at index {:?}",
+            count,
+            request.previous_entry,
+        );
         let inconsistent = {
             if self.log.get_index() == 0 {
                 prior_index != 0
@@ -87,6 +95,7 @@ impl<'a, Record: Debug> Raft<'a, Record> {
                 true
             } else {
                 let (check_term, _record) = self.log.get_entry(prior_index);
+                trace!("(prior entry term: {})", check_term);
                 *check_term != request.previous_entry.term
             }
         };
@@ -95,37 +104,54 @@ impl<'a, Record: Debug> Raft<'a, Record> {
         let success = if request_from_prior_term || inconsistent {
             false
         } else {
-            let count = request.entries.len() as u64;
             let prior_index = request.previous_entry.index;
-            if request.leader_commit > self.volatile_state.commit_index {
-                let last_index = prior_index + count;
-                let min_index = min(request.leader_commit, last_index);
-                self.volatile_state.commit_index = min_index;
-            }
+            let last_index = prior_index + count;
 
             self.log.insert(prior_index + 1, request.entries);
+            trace!("Log updated; new length: {}", last_index);
+
+            if request.leader_commit > self.volatile_state.commit_index {
+                let min_index = min(request.leader_commit, last_index);
+                self.volatile_state.commit_index = min_index;
+                trace!("Committed entries, new commit index: {}", min_index);
+            }
 
             true
         };
 
-        Append {
+        let response = Append {
             term: current_term,
             success: success
-        }
+        };
+        debug!("TX: {:?}", response);
+        response
     }
 
     pub fn request_vote (&mut self, request: RequestVote) -> Vote {
         let current_term = self.log.get_current_term();
 
+        debug!("RX: {:?}", request);
+
         let vote_granted = if request.term < current_term { false } else {
-            let prior_vote = match self.log.get_voted_for() {
-                Some(ref vote) => *vote == request.candidate_id,
-                None => true
+            let prior_vote = {
+                let voted_for = self.log.get_voted_for();
+
+                trace!("prior vote: {:?}", voted_for);
+                match voted_for {
+                    Some(ref vote) => *vote == request.candidate_id,
+                    None => true
+                }
             };
 
-            let log_current = if request.last_log.term == current_term {
-                request.last_log.index >= self.log.get_index()
-            } else { request.last_log.term > current_term };
+            let index = self.log.get_index();
+            let term = if index == 0 { 0 } else {
+                let (last, _record) = self.log.get_entry(index - 1);
+                *last
+            };
+            trace!("current log: term {} index {}", term, index);
+            let log_current = if request.last_log.term == term {
+                request.last_log.index >= index
+            } else { request.last_log.term > term };
 
             prior_vote || log_current
         };
@@ -134,10 +160,12 @@ impl<'a, Record: Debug> Raft<'a, Record> {
             self.log.set_voted_for(Some(request.candidate_id));
         }
 
-        Vote {
+        let response = Vote {
             term: current_term,
             vote_granted: vote_granted
-        }
+        };
+        debug!("TX: {:?}", response);
+        response
     }
 }
 
@@ -186,7 +214,8 @@ impl<Record> Log<Record> for MemoryLog<Record> {
 
 #[cfg(test)]
 mod tests {
-    use raft::*;
+    use super::*;
+    extern crate env_logger;
 
     fn boxed(raw: Vec<(u64, u64)>) -> Vec<(u64, Box<u64>)> {
         raw.iter().map(|(t, v)| (*t, Box::new(*v))).collect()
@@ -198,6 +227,7 @@ mod tests {
 
     #[test]
     fn append_entries_from_empty() {
+        let _ = env_logger::try_init();
         let mut log: MemoryLog<u64> = MemoryLog::new();
         {
             let mut raft: Raft<u64> = Raft::new(&mut log);
@@ -230,6 +260,7 @@ mod tests {
 
     #[test]
     fn append_inconsistent_entries () {
+        let _ = env_logger::try_init();
         let mut log: MemoryLog<u64> = MemoryLog::new();
         {
             let mut raft: Raft<u64> = Raft::new(&mut log);
@@ -279,6 +310,7 @@ mod tests {
 
     #[test]
     fn vote_granted () {
+        let _ = env_logger::try_init();
         let mut log: MemoryLog<u64> = MemoryLog::new();
         {
             let mut raft: Raft<u64> = Raft::new(&mut log);
