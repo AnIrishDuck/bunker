@@ -143,15 +143,11 @@ impl<'a, Record: Debug> Raft<'a, Record> {
                 }
             };
 
-            let index = self.log.get_index();
-            let term = if index == 0 { 0 } else {
-                let (last, _record) = self.log.get_entry(index - 1);
-                *last
-            };
-            trace!("current log: term {} index {}", term, index);
-            let log_current = if request.last_log.term == term {
-                request.last_log.index >= index
-            } else { request.last_log.term > term };
+            let last = self.get_last_log_entry();
+            trace!("last log entry: {:?}", last);
+            let log_current = if request.last_log.term == last.term {
+                request.last_log.index >= last.index
+            } else { request.last_log.term > last.term };
 
             prior_vote || log_current
         };
@@ -166,6 +162,15 @@ impl<'a, Record: Debug> Raft<'a, Record> {
         };
         debug!("TX: {:?}", response);
         response
+    }
+
+    fn get_last_log_entry (&mut self) -> LogEntry {
+        let index = self.log.get_index();
+        let term = if index == 0 { 0 } else {
+            let (last, _record) = self.log.get_entry(index - 1);
+            *last
+        };
+        LogEntry { index: index, term: term }
     }
 }
 
