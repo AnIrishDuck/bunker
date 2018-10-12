@@ -1,4 +1,5 @@
 use raft::Log;
+use std::cmp::min;
 
 pub struct MemoryLog<Record> {
     pub term: u64,
@@ -12,7 +13,7 @@ impl<Record> MemoryLog<Record> {
     }
 }
 
-impl<Record> Log<Record> for MemoryLog<Record> {
+impl<Record: Clone> Log<Record> for MemoryLog<Record> {
     fn get_current_term (&self) -> u64 {
         self.term
     }
@@ -40,5 +41,10 @@ impl<Record> Log<Record> for MemoryLog<Record> {
     fn insert (&mut self, index: u64, records: Vec<(u64, Box<Record>)>) {
         self.records.truncate(index as usize);
         self.records.extend(records);
+    }
+
+    fn get_batch (&self, index: u64) -> Vec<(u64, Box<Record>)> {
+        let end = min((index + 5) as usize, self.records.len());
+        self.records[index as usize..end].to_vec()
     }
 }

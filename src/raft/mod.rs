@@ -4,6 +4,7 @@ use std::fmt::{Debug};
 
 mod follower;
 mod candidate;
+mod leader;
 mod log;
 
 /* prelude: definitions from page 4 of the raft paper */
@@ -17,6 +18,8 @@ pub trait Log<Record> {
     fn get_index (&self) -> u64;
     fn get_entry (&self, index: u64) -> &(u64, Box<Record>);
     fn insert (&mut self, index: u64, records: Vec<(u64, Box<Record>)>);
+
+    fn get_batch (&self, index: u64) -> Vec<(u64, Box<Record>)>;
 }
 
 pub trait StateMachine<Record> {
@@ -26,7 +29,8 @@ pub trait StateMachine<Record> {
 pub struct VolatileState<'a> {
     commit_index: u64,
     // we will track last_applied in the state machine
-    candidate: candidate::State<'a>
+    candidate: candidate::State<'a>,
+    leader: leader::State<'a>
 }
 
 pub struct Cluster {
@@ -54,6 +58,8 @@ pub struct Append {
     success: bool
 }
 
+type AppendResponse = Future<Item=Append, Error=String>;
+
 #[derive(Debug)]
 pub struct RequestVote {
     term: u64,
@@ -70,7 +76,7 @@ pub struct Vote {
 type VoteResponse = Future<Item=Vote, Error=String>;
 
 pub trait Link<Record> {
-    fn append_entries(&self,id: &String, request: AppendEntries<Record>) -> Append;
+    fn append_entries(&self,id: &String, request: AppendEntries<Record>) -> Box<AppendResponse>;
 
     fn request_vote (&self, id: &String, request: RequestVote) -> Box<VoteResponse>;
 }
@@ -98,7 +104,8 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
     pub fn new (cluster: Cluster, config: &'a Config, log: &'a mut Log<Record>, link: &'a Link<Record>) -> Self {
         let volatile = VolatileState {
             candidate: candidate::State::new(),
-            commit_index: 0
+            commit_index: 0,
+            leader: leader::State::new()
         };
 
         Raft {
@@ -186,8 +193,8 @@ impl NullLink {
 }
 
 impl<Record> Link<Record> for NullLink {
-    fn append_entries(&self, _id: &String, _request: AppendEntries<Record>) -> Append {
-        Append { term: 0, success: false }
+    fn append_entries(&self, _id: &String, _request: AppendEntries<Record>) -> Box<AppendResponse> {
+        Box::new(future::ok(Append { term: 0, success: false }))
     }
 
     fn request_vote (&self, _id: &String, _request: RequestVote) -> Box<VoteResponse> {
