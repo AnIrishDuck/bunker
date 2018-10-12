@@ -22,6 +22,7 @@ impl<'a> State<'a> {
 }
 
 pub fn become_leader<'a, Record> (raft: &'a mut Raft<'a, Record>) {
+    info!("Becoming Leader");
     raft.role = Role::Leader;
 
     let followers = raft.cluster.peers.iter().map(|id| {
@@ -65,7 +66,7 @@ pub fn leader_push<'a, Record> (raft: &'a mut Raft<'a, Record>) {
                             true
                         },
                         Err(string) => {
-                            error!("Error pushing records: {}", string);
+                            error!("AppendEntries error: {}", string);
                             true
                         }
                     }

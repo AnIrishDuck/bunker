@@ -24,13 +24,15 @@ impl<'a> State<'a> {
 }
 
 pub fn become_candidate<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
+    info!("Becoming Candidate");
     raft.role = Role::Candidate;
     start_election(raft);
 }
 
 pub fn start_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
-    let term = raft.log.get_current_term();
-    raft.log.set_current_term(term + 1);
+    let term = raft.log.get_current_term() + 1;
+    raft.log.set_current_term(term);
+    trace!("starting new election, term {}", term);
 
     let last_log = raft.get_last_log_entry();
 
@@ -67,16 +69,27 @@ pub fn tick_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) -> bool
             let id = p.id;
             match p.response.poll() {
                 Ok(Async::Ready(message)) => {
+                    trace!("rx vote: {:?}", message);
                     if message.vote_granted {
                         election.votes.insert(&id);
                     }
                 }
+                Err(message) => error!("RequestVote error: {}", message),
                 _ => ()
             }
         }
 
+        let votes_received = election.votes.len();
+        let quorum = (raft.cluster.peers.len() / 2) + 1;
+        trace!(
+            "current votes received: {}, quorum: {}, ticks: {}",
+            votes_received,
+            quorum,
+            election.ticks
+        );
+
         (
-            election.votes.len() > (raft.cluster.peers.len() / 2) + 1,
+            votes_received > quorum,
             election.ticks > config.election_restart_ticks
         )
     };
@@ -85,6 +98,7 @@ pub fn tick_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) -> bool
         true
     } else {
         if timeout {
+            debug!("election timed out, restarting");
             start_election(raft);
         }
 
