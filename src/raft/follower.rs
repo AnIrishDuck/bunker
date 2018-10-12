@@ -1,7 +1,38 @@
 use raft::*;
 
+pub struct State {
+    heartbeat_ticks: u64
+}
+
+impl State {
+    pub fn new () -> Self {
+        State { heartbeat_ticks: 0 }
+    }
+}
+
+pub fn become_follower<Record> (raft: &mut Raft<Record>) {
+    raft.volatile_state.follower = State::new();
+    raft.role = Role::Follower;
+}
+
+pub fn tick<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
+    let ticks = {
+        let ref mut ticks = raft.volatile_state.follower.heartbeat_ticks;
+        *ticks += 1;
+        *ticks
+    };
+
+    let timeout = raft.config.election_restart_ticks as u64;
+    if ticks > timeout {
+        info!("Leader timed out, becoming candidate");
+        candidate::become_candidate(raft);
+    }
+}
+
 pub fn append_entries<Record> (raft: &mut Raft<Record>, request: AppendEntries<Record>) -> bool {
     let current_term = raft.log.get_current_term();
+
+    raft.volatile_state.follower.heartbeat_ticks = 0;
 
     let request_from_prior_term = request.term < current_term;
     let prior_index = request.previous_entry.index;

@@ -37,7 +37,7 @@ pub fn become_leader<'a, Record> (raft: &'a mut Raft<'a, Record>) {
     raft.volatile_state.leader = State { followers: followers };
 }
 
-pub fn leader_push<'a, Record> (raft: &'a mut Raft<'a, Record>) {
+pub fn tick<'a, Record> (raft: &'a mut Raft<'a, Record>) {
     let term = raft.log.get_current_term();
 
     {

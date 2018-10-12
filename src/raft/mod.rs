@@ -30,7 +30,8 @@ pub struct VolatileState<'a> {
     commit_index: u64,
     // we will track last_applied in the state machine
     candidate: candidate::State<'a>,
-    leader: leader::State<'a>
+    leader: leader::State<'a>,
+    follower: follower::State
 }
 
 pub struct Cluster {
@@ -106,6 +107,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         let volatile = VolatileState {
             candidate: candidate::State::new(),
             commit_index: 0,
+            follower: follower::State::new(),
             leader: leader::State::new()
         };
 
@@ -207,6 +209,14 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
             *last
         };
         LogEntry { index: index, term: term }
+    }
+
+    fn tick (&'a mut self) {
+        match self.role {
+            Role::Follower => follower::tick(self),
+            Role::Candidate => candidate::tick(self),
+            Role::Leader => leader::tick(self)
+        }
     }
 }
 

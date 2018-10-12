@@ -57,7 +57,7 @@ pub fn start_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
     }).collect();
 }
 
-pub fn tick_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) -> bool {
+pub fn tick<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
     let (majority, timeout) = {
         let ref config = raft.config;
         let ref mut state = raft.volatile_state;
@@ -95,14 +95,12 @@ pub fn tick_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) -> bool
     };
 
     if majority {
-        true
+        leader::become_leader(raft);
     } else {
         if timeout {
             debug!("election timed out, restarting");
             start_election(raft);
         }
-
-        false
     }
 }
 
