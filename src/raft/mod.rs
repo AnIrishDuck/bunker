@@ -81,6 +81,7 @@ pub trait Link<Record> {
     fn request_vote (&self, id: &String, request: RequestVote) -> Box<VoteResponse>;
 }
 
+#[derive(PartialEq)]
 pub enum Role { Follower, Candidate, Leader }
 
 pub struct Config {
@@ -118,8 +119,34 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         }
     }
 
+    pub fn check_term(&mut self, message_term: u64) -> u64 {
+        let term = self.log.get_current_term();
+        // # Rules for Servers / All Servers
+        // If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower (§5.1)
+        let new_leader = message_term > term;
+        // # Rules for Servers / Candidates:
+        // If AppendEntries RPC received from new leader: convert to follower
+        let candidate = self.role == Role::Candidate;
+
+        let election_lost = candidate && message_term == term;
+        if new_leader || election_lost {
+            if new_leader {
+                trace!("following new leader with term {}", message_term);
+            } else {
+                trace!("lost election for term {}", message_term);
+            }
+
+            self.log.set_current_term(message_term);
+            self.role = Role::Follower;
+            message_term
+        } else {
+            term
+        }
+    }
+
     pub fn append_entries (&mut self, request: AppendEntries<Record>) -> Append {
-        let current_term = self.log.get_current_term();
+        let current_term = self.check_term(request.term);
         let count = request.entries.len() as u64;
         debug!(
             "RX AppendEntries: {} at index {:?}",
@@ -138,7 +165,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
     }
 
     pub fn request_vote (&mut self, request: RequestVote) -> Vote {
-        let current_term = self.log.get_current_term();
+        let current_term = self.check_term(request.term);
 
         debug!("RX: {:?}", request);
         let vote_granted = if request.term < current_term { false } else {
