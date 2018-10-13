@@ -45,6 +45,7 @@ pub struct LogEntry {
     term: u64
 }
 
+#[derive(Debug, Clone)]
 pub struct AppendEntries<Record> {
     term: u64,
     // we never ended up needing leader_id
@@ -53,7 +54,7 @@ pub struct AppendEntries<Record> {
     leader_commit: u64
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Append {
     term: u64,
     success: bool
@@ -61,14 +62,14 @@ pub struct Append {
 
 type AppendResponse = Future<Item=Append, Error=String>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestVote {
     term: u64,
     candidate_id: String,
     last_log: LogEntry
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Vote {
     term: u64,
     vote_granted: bool
@@ -243,14 +244,202 @@ impl<Record> Link<Record> for NullLink {
 mod tests {
     use super::*;
     use super::log::MemoryLog;
+    use std::collections::HashMap;
+    use std::cell::RefCell;
+    use std::rc::{Rc, Weak};
+    use tokio::prelude::*;
 
     extern crate env_logger;
+
+    #[derive(Clone)]
+    struct Call<Request, Response> {
+        request: RefCell<Option<Request>>,
+        response: RefCell<Option<Result<Response, String>>>
+    }
+
+    impl<Request, Response> Call<Request, Response> {
+        fn new() -> Self {
+            Call {
+                request: RefCell::new(None),
+                response: RefCell::new(None)
+            }
+        }
+
+        fn request(&self, r: Request) {
+            assert!(self.request.replace(Some(r)).is_none());
+        }
+
+        fn resolve(&self, r: Result<Response, String>) {
+            *self.response.borrow_mut() = Some(r);
+        }
+
+        fn reset(&self) {
+            *self.request.borrow_mut() = None;
+            *self.response.borrow_mut() = None;
+        }
+    }
+
+    impl<X, T: Clone> Future for Call<X, T>
+    {
+        type Item = T;
+        type Error = String;
+
+        fn poll (&mut self) -> Result<Async<T>, String> {
+            match self.response.borrow().as_ref() {
+                Some(Ok(r)) => {
+                    let o: T = r.clone();
+                    Ok(Async::Ready(o))
+                },
+                Some(Err(e)) => Err(e.clone()),
+                None => Ok(Async::NotReady)
+            }
+        }
+    }
+
+    type Incoming<Request, Response> = HashMap<
+        String, RefCell<Call<Request, Response>>
+    >;
+
+    struct SwitchLink<'a, Record: Debug + Clone> {
+        id: String,
+        append: Incoming<AppendEntries<Record>, Append>,
+        vote: Incoming<RequestVote, Vote>,
+        switch: RefCell<Weak<Switchboard<'a, Record>>>
+    }
+
+    fn blank<Req, Res> (peers: &Vec<String>) -> Incoming<Req, Res> {
+        peers.iter().map(|i| {
+            (i.to_string(), RefCell::new(Call::new()))
+        }).collect()
+    }
+
+    impl<'a, Record: Debug + Clone> SwitchLink<'a, Record> {
+        fn new (id: &String, peers: &Vec<String>) -> Self {
+            SwitchLink {
+                id: id.clone(),
+                append: blank(&peers),
+                vote: blank(&peers),
+                switch: RefCell::new(Weak::new())
+            }
+        }
+
+        fn node(&self, id: &String) -> Rc<Node<'a, Record>> {
+            let parent = self.switch.borrow().upgrade().unwrap();
+            (*parent.nodes.get(id).unwrap()).clone()
+        }
+    }
+
+    impl<'a, Record: Debug + Clone + 'static> Link<Record> for SwitchLink<'a, Record> {
+        fn append_entries(&self, id: &String, r: AppendEntries<Record>) -> Box<AppendResponse> {
+            let peer = &self.node(id).link;
+            let call = peer.append.get(&self.id).unwrap().borrow();
+            call.request(r);
+            Box::new(call.clone())
+        }
+
+        fn request_vote (&self, id: &String, r: RequestVote) -> Box<VoteResponse> {
+            let peer = &self.node(id).link;
+            let call = peer.vote.get(&self.id).unwrap().borrow();
+            call.request(r);
+            Box::new(call.clone())
+        }
+    }
+
+    struct Node<'a, Record: Debug + Clone> {
+        raft: Raft<'a, Record>,
+        link: &'a SwitchLink<'a, Record>,
+    }
+
+    struct Switchboard<'a, Record: Debug + Clone> {
+        nodes: HashMap<String, Rc<Node<'a, Record>>>,
+        ids: Vec<String>
+    }
+
+    impl<'a, Record: Debug + Clone + 'static> Switchboard<'a, Record> {
+        fn new (ids: Vec<String>, data: Vec<(String, &'a mut MemoryLog<Record>, &'a mut SwitchLink<'a, Record>)>) -> Rc<Self> {
+            let nodes = data.into_iter().map(|(id, log, link)| {
+                let cluster = Cluster {
+                    id: id.to_string(),
+                    peers: ids.clone()
+                };
+                let raft = Raft::new(cluster, &DEFAULT_CONFIG, log, link);
+                (
+                    id.to_string(),
+                    Rc::new(Node {
+                        raft: raft,
+                        link: link,
+                    })
+                )
+            }).collect();
+
+            let switch = Rc::new(Switchboard { nodes: nodes, ids: ids.clone() });
+
+            for ref node in switch.nodes.values() {
+                *node.link.switch.borrow_mut() = Rc::downgrade(&switch);
+            }
+
+            switch
+        }
+
+        fn tick (&'a mut self) {
+            for node in self.nodes.values_mut() {
+                Rc::get_mut(node).unwrap().raft.tick();
+            }
+        }
+
+        fn process_messages (&'a mut self) {
+            for node in self.nodes.values_mut() {
+                let n = Rc::get_mut(node).unwrap();
+                let r: &'a mut Raft<'a, Record> = &mut n.raft;
+                for cell in n.link.append.values() {
+                    let mut call = cell.borrow_mut();
+                    let request = call.request.borrow().clone().unwrap();
+                    call.resolve(Ok(r.append_entries(request)));
+                    *call = Call::new();
+                }
+
+                for cell in n.link.vote.values() {
+                    let mut call = cell.borrow_mut();
+                    let request = call.request.borrow().clone().unwrap();
+                    call.resolve(Ok(r.request_vote(request)));
+                    *call = Call::new();
+                }
+            }
+        }
+    }
 
     fn cluster () -> Cluster {
         Cluster {
             id: "me".to_string(),
             peers: vec!["other".to_string()]
         }
+    }
+
+    #[test]
+    fn leader_elected () {
+        let ids: Vec<String> = vec!["a", "b", "c"].iter().map(|v| {
+            v.to_string()
+        }).collect();
+
+        let mut data: Vec<(String, MemoryLog<u64>, SwitchLink<u64>)> = ids.iter().map(|id| {
+            let log = MemoryLog::new();
+            let link = SwitchLink::new(&id, &ids);
+            (id.clone(), log, link)
+        }).collect();
+
+        {
+            let x: &mut Vec<_> = &mut data;
+            let refs: Vec<_> = x.iter_mut().map(|(ref id, ref mut log, ref mut link)| {
+                (id.clone(), log, link)
+            }).collect();
+
+            let switch = Switchboard::new(ids, refs);
+            drop(x);
+            drop(switch);
+        }
+
+        // drop(switch);
+        drop(data);
     }
 
     #[test]
