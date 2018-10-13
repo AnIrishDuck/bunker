@@ -1,50 +1,68 @@
 use raft::Log;
+use std::cell::RefCell;
 use std::cmp::min;
+use std::fmt::Debug;
+use std::rc::Rc;
 
-pub struct MemoryLog<Record> {
+pub struct State<Record> {
     pub term: u64,
     pub voted_for: Option<String>,
     pub records: Vec<(u64, Box<Record>)>
 }
 
+#[derive(Clone)]
+pub struct MemoryLog<Record> {
+    pub state: Rc<RefCell<State<Record>>>
+}
+
 impl<Record> MemoryLog<Record> {
     pub fn new () -> Self {
-        MemoryLog { term: 0, voted_for: None, records: vec![] }
+        let state = State { term: 0, voted_for: None, records: vec![] };
+        MemoryLog {
+            state: Rc::new(RefCell::new(state))
+        }
     }
 }
 
-impl<Record: Clone> Log<Record> for MemoryLog<Record> {
+impl<Record: Clone + Debug> Log<Record> for MemoryLog<Record> {
     fn get_current_term (&self) -> u64 {
-        self.term
+        self.state.borrow().term
     }
 
     fn set_current_term (&mut self, term: u64) {
-        self.term = term;
+        self.state.borrow_mut().term = term;
     }
 
-    fn get_voted_for (&self) -> &Option<String> {
-        &self.voted_for
+    fn get_voted_for (&self) -> Option<String> {
+        self.state.borrow().voted_for.clone()
     }
 
     fn set_voted_for (&mut self, candidate: Option<String>) {
-        self.voted_for = candidate
+        self.state.borrow_mut().voted_for = candidate
     }
 
     fn get_index (&self) -> u64 {
-        self.records.len() as u64
+        self.state.borrow().records.len() as u64
     }
 
-    fn get_entry (&self, index: u64) -> &(u64, Box<Record>) {
-        &self.records[index as usize]
+    fn get_entry (&self, index: u64) -> Option<(u64, Box<Record>)> {
+        if index < self.get_index() {
+            Some(self.state.borrow().records[index as usize].clone())
+        } else {
+            None
+        }
     }
 
-    fn insert (&mut self, index: u64, records: Vec<(u64, Box<Record>)>) {
-        self.records.truncate(index as usize);
-        self.records.extend(records);
+    fn insert (&mut self, index: u64, update: Vec<(u64, Box<Record>)>) {
+        let ref mut records = self.state.borrow_mut().records;
+        records.truncate(index as usize);
+        records.extend(update);
     }
 
     fn get_batch (&self, index: u64) -> Vec<(u64, Box<Record>)> {
-        let end = min((index + 5) as usize, self.records.len());
-        self.records[index as usize..end].to_vec()
+        let ref records = self.state.borrow().records;
+        let start = min(index as usize, records.len());
+        let end = min((start + 5) as usize, records.len());
+        records[start..end].to_vec()
     }
 }

@@ -15,7 +15,7 @@ pub fn become_follower<Record> (raft: &mut Raft<Record>) {
     raft.role = Role::Follower;
 }
 
-pub fn tick<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
+pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
     let ticks = {
         let ref mut ticks = raft.volatile_state.follower.heartbeat_ticks;
         *ticks += 1;
@@ -44,9 +44,10 @@ pub fn append_entries<Record> (raft: &mut Raft<Record>, request: AppendEntries<R
         } else if raft.log.get_index() <= prior_index {
             true
         } else {
-            let (check_term, _record) = raft.log.get_entry(prior_index);
+            let entry = raft.log.get_entry(prior_index);
+            let check_term = entry.map(|(t, _)| t).unwrap_or(0);
             trace!("Prior entry term: {}", check_term);
-            *check_term != request.previous_entry.term
+            check_term != request.previous_entry.term
         }
     };
 
@@ -79,10 +80,11 @@ mod tests {
 
     extern crate env_logger;
 
-    fn cluster () -> Cluster {
+
+    fn single_node_cluster<'a> (id: &'a String) -> Cluster<'a> {
         Cluster {
-            id: "me".to_string(),
-            peers: vec!["other".to_string()]
+            id: &id,
+            peers: vec![&id]
         }
     }
 
@@ -94,13 +96,20 @@ mod tests {
         records.iter().map(|&(t, ref v)| (t, *v.clone())).collect()
     }
 
+    fn record_vec(log: &MemoryLog<u64>) -> Vec<(u64, u64)> {
+        let ref records = log.state.borrow().records;
+        unboxed(records)
+    }
+
     #[test]
     fn append_entries_from_empty() {
         let _ = env_logger::try_init();
-        let mut log: MemoryLog<u64> = MemoryLog::new();
+        let id = "me".to_owned();
+        let cluster = single_node_cluster(&id);
+        let log: MemoryLog<u64> = MemoryLog::new();
         let link: NullLink = NullLink::new();
         {
-            let mut raft: Raft<u64> = Raft::new(cluster(), &DEFAULT_CONFIG, &mut log, &link);
+            let mut raft: Raft<u64> = Raft::new(cluster, &DEFAULT_CONFIG, Box::new(log.clone()), Box::new(link));
 
             let response = raft.append_entries(AppendEntries {
                 term: 0,
@@ -113,7 +122,7 @@ mod tests {
             assert_eq!(response.success, true);
             assert_eq!(raft.volatile_state.commit_index, 3);
         }
-        assert_eq!(unboxed(&log.records), vec![(0, 1), (0, 2), (0, 3)]);
+        assert_eq!(record_vec(&log), vec![(0, 1), (0, 2), (0, 3)]);
     }
 
     fn fill_term (raft: &mut Raft<u64>, term: u64, prior: LogEntry, count: u64) {
@@ -131,10 +140,12 @@ mod tests {
     #[test]
     fn append_inconsistent_entries () {
         let _ = env_logger::try_init();
-        let mut log: MemoryLog<u64> = MemoryLog::new();
+        let id = "me".to_owned();
+        let cluster = single_node_cluster(&id);
+        let log: MemoryLog<u64> = MemoryLog::new();
         let link: NullLink = NullLink::new();
         {
-            let mut raft: Raft<u64> = Raft::new(cluster(), &DEFAULT_CONFIG, &mut log, &link);
+            let mut raft: Raft<u64> = Raft::new(cluster, &DEFAULT_CONFIG, Box::new(log.clone()), Box::new(link));
 
             let response = raft.append_entries(AppendEntries {
                 term: 0,
@@ -170,7 +181,7 @@ mod tests {
             assert_eq!(response.success, true);
         }
 
-        assert_eq!(unboxed(&log.records), vec![
+        assert_eq!(record_vec(&log), vec![
             (1, 0),
             (1, 0),
             (1, 0),

@@ -21,7 +21,7 @@ impl<'a> State<'a> {
     }
 }
 
-pub fn become_leader<'a, Record> (raft: &'a mut Raft<'a, Record>) {
+pub fn become_leader<'a, Record> (raft: &mut Raft<'a, Record>) {
     info!("Becoming Leader");
     raft.role = Role::Leader;
 
@@ -37,7 +37,7 @@ pub fn become_leader<'a, Record> (raft: &'a mut Raft<'a, Record>) {
     raft.volatile_state.leader = State { followers: followers };
 }
 
-pub fn tick<'a, Record> (raft: &'a mut Raft<'a, Record>) {
+pub fn tick<'a, Record> (raft: &mut Raft<'a, Record>) {
     let term = raft.log.get_current_term();
 
     {
@@ -71,15 +71,16 @@ pub fn tick<'a, Record> (raft: &'a mut Raft<'a, Record>) {
                         }
                     }
                 },
-                None => false
+                None => true
             };
 
             if send_more {
                 let missing_entries = raft.log.get_index() <= follower.next_index;
                 let (prior, records) = if missing_entries {
-                    let (term, _) = raft.log.get_entry(follower.next_index);
+                    let entry = raft.log.get_entry(follower.next_index);
+                    let term = entry.map(|(t, _)| t).unwrap_or(0);
                     (
-                        LogEntry { index: follower.next_index, term: *term },
+                        LogEntry { index: follower.next_index, term: term },
                         raft.log.get_batch(follower.next_index)
                     )
                 } else { (LogEntry { index: 0, term: 0}, vec![]) };
@@ -107,8 +108,8 @@ pub fn tick<'a, Record> (raft: &'a mut Raft<'a, Record>) {
     {
         let ref leader = raft.volatile_state.leader;
         let mut matches: Vec<u64> = leader.followers.iter().map(|follower| {
-            let (entry_term, _) = raft.log.get_entry(follower.match_index);
-            if *entry_term == term {
+            let entry = raft.log.get_entry(follower.match_index);
+            if entry.map(|(t, _)| t).unwrap_or(0) == term {
                 follower.match_index
             } else { 0 }
         }).collect();

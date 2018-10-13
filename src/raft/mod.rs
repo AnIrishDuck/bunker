@@ -12,11 +12,11 @@ pub trait Log<Record> {
     fn get_current_term (&self) -> u64;
     fn set_current_term (&mut self, term: u64);
 
-    fn get_voted_for (&self) -> &Option<String>;
+    fn get_voted_for (&self) -> Option<String>;
     fn set_voted_for (&mut self, candidate: Option<String>);
 
     fn get_index (&self) -> u64;
-    fn get_entry (&self, index: u64) -> &(u64, Box<Record>);
+    fn get_entry (&self, index: u64) -> Option<(u64, Box<Record>)>;
     fn insert (&mut self, index: u64, records: Vec<(u64, Box<Record>)>);
 
     fn get_batch (&self, index: u64) -> Vec<(u64, Box<Record>)>;
@@ -34,9 +34,9 @@ pub struct VolatileState<'a> {
     follower: follower::State
 }
 
-pub struct Cluster {
-    id: String,
-    peers: Vec<String>
+pub struct Cluster<'a> {
+    id: &'a String,
+    peers: Vec<&'a String>
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +45,7 @@ pub struct LogEntry {
     term: u64
 }
 
+#[derive(Debug, Clone)]
 pub struct AppendEntries<Record> {
     term: u64,
     // we never ended up needing leader_id
@@ -53,7 +54,7 @@ pub struct AppendEntries<Record> {
     leader_commit: u64
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Append {
     term: u64,
     success: bool
@@ -61,14 +62,14 @@ pub struct Append {
 
 type AppendResponse = Future<Item=Append, Error=String>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestVote {
     term: u64,
     candidate_id: String,
     last_log: LogEntry
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Vote {
     term: u64,
     vote_granted: bool
@@ -95,15 +96,15 @@ static DEFAULT_CONFIG: Config = Config {
 
 pub struct Raft<'a, Record: 'a> {
     config: &'a Config,
-    cluster: Cluster,
+    cluster: Cluster<'a>,
     volatile_state: VolatileState<'a>,
-    log: &'a mut Log<Record>,
-    link: &'a Link<Record>,
+    log: Box<Log<Record> + 'a>,
+    link: Box<Link<Record> + 'a>,
     role: Role
 }
 
 impl<'a, Record: Debug + 'a> Raft<'a, Record> {
-    pub fn new (cluster: Cluster, config: &'a Config, log: &'a mut Log<Record>, link: &'a Link<Record>) -> Self {
+    pub fn new (cluster: Cluster<'a>, config: &'a Config, log: Box<Log<Record> + 'a>, link: Box<Link<Record> + 'a>) -> Self {
         let volatile = VolatileState {
             candidate: candidate::State::new(),
             commit_index: 0,
@@ -140,7 +141,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
             }
 
             self.log.set_current_term(message_term);
-            self.role = Role::Follower;
+            follower::become_follower(self);
             message_term
         } else {
             term
@@ -181,11 +182,12 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
                 }
             };
 
-            let last = self.get_last_log_entry();
-            trace!("last log entry: {:?}", last);
-            let log_current = if request.last_log.term == last.term {
-                request.last_log.index >= last.index
-            } else { request.last_log.term > last.term };
+            let log_current = self.get_last_log_entry().map(|last| {
+                trace!("last log entry: {:?}", last);
+                if request.last_log.term == last.term {
+                    request.last_log.index >= last.index
+                } else { request.last_log.term > last.term }
+            }).unwrap_or(true);
 
             prior_vote || log_current
         };
@@ -202,16 +204,19 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         response
     }
 
-    fn get_last_log_entry<'b> (&'b mut self) -> LogEntry {
+    fn get_last_log_entry<'b> (&'b mut self) -> Option<LogEntry> {
         let index = self.log.get_index();
-        let term = if index == 0 { 0 } else {
-            let (last, _record) = self.log.get_entry(index - 1);
-            *last
-        };
-        LogEntry { index: index, term: term }
+
+        if index > 0 {
+            self.log.get_entry(index - 1).map(|(term, _)| {
+                LogEntry { index: index, term: term }
+            })
+        } else {
+            None
+        }
     }
 
-    fn tick (&'a mut self) {
+    fn tick (&mut self) {
         match self.role {
             Role::Follower => follower::tick(self),
             Role::Candidate => candidate::tick(self),
@@ -243,23 +248,243 @@ impl<Record> Link<Record> for NullLink {
 mod tests {
     use super::*;
     use super::log::MemoryLog;
+    use std::collections::HashMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use tokio::prelude::*;
 
     extern crate env_logger;
 
-    fn cluster () -> Cluster {
+    #[derive(Clone)]
+    struct Call<Request, Response> {
+        request: Request,
+        response: Rc<RefCell<Option<Result<Response, String>>>>
+    }
+
+    impl<Request, Response> Call<Request, Response> {
+        fn new(r: Request) -> Self {
+            Call {
+                request: r,
+                response: Rc::new(RefCell::new(None))
+            }
+        }
+
+        fn resolve(&self, r: Result<Response, String>) {
+            *self.response.borrow_mut() = Some(r);
+        }
+    }
+
+    impl<X, T: Clone> Future for Call<X, T>
+    {
+        type Item = T;
+        type Error = String;
+
+        fn poll (&mut self) -> Result<Async<T>, String> {
+            match self.response.borrow().as_ref() {
+                Some(Ok(r)) => {
+                    let o: T = r.clone();
+                    Ok(Async::Ready(o))
+                },
+                Some(Err(e)) => Err(e.clone()),
+                None => Ok(Async::NotReady)
+            }
+        }
+    }
+
+    type Incoming<Request, Response> = Rc<RefCell<HashMap<
+        String, Call<Request, Response>
+    >>>;
+
+    #[derive(Clone)]
+    struct SwitchLink {
+        id: String,
+        append: Incoming<AppendEntries<u64>, Append>,
+        vote: Incoming<RequestVote, Vote>,
+    }
+
+    impl SwitchLink {
+        fn new (id: &String) -> Self {
+            SwitchLink {
+                id: id.clone(),
+                append: Rc::new(RefCell::new(HashMap::new())),
+                vote: Rc::new(RefCell::new(HashMap::new()))
+            }
+        }
+    }
+
+    impl Link<u64> for SwitchLink {
+        fn append_entries(&self, id: &String, r: AppendEntries<u64>) -> Box<AppendResponse> {
+            trace!("{} => {:?} => {}", self.id, r, id);
+            let ref mut calls = self.append.borrow_mut();
+            assert!(!calls.contains_key(id));
+            let call = Call::new(r);
+            calls.insert(id.clone(), call.clone());
+            Box::new(call)
+        }
+
+        fn request_vote (&self, id: &String, r: RequestVote) -> Box<VoteResponse> {
+            trace!("{} => {:?} => {}", self.id, r, id);
+            let ref mut calls = self.vote.borrow_mut();
+            assert!(!calls.contains_key(id));
+            let call = Call::new(r);
+            calls.insert(id.clone(), call.clone());
+            Box::new(call)
+        }
+    }
+
+    struct Node<'a> {
+        raft: Raft<'a, u64>,
+        link: SwitchLink
+    }
+
+    struct Switchboard<'a> {
+        nodes: HashMap<String, RefCell<Node<'a>>>
+    }
+
+    fn others<'a> (id: &'a String, ids: &Vec<&'a String>) -> Vec<&'a String> {
+        ids.iter().filter(|peer_id| **peer_id != id).map(|i| i.clone()).collect()
+    }
+
+    impl<'a> Switchboard<'a> {
+        fn new (ids: Vec<&'a String>) -> Self {
+            let nodes: HashMap<String, RefCell<Node<'a>>> = ids.iter().map(|id| {
+                let cluster: Cluster<'a> = Cluster {
+                    id: id,
+                    peers: others(id, &ids)
+                };
+                let log = MemoryLog::new();
+                let link = SwitchLink::new(&id);
+                let raft = Raft::new(
+                    cluster,
+                    &DEFAULT_CONFIG,
+                    Box::new(log),
+                    Box::new(link.clone())
+                );
+
+                let n: Node<'a> = Node {
+                    raft: raft,
+                    link: link,
+                };
+
+                (
+                    id.to_string(),
+                    RefCell::new(n)
+                )
+            }).collect();
+
+            Switchboard {
+                nodes: nodes
+            }
+        }
+
+        fn tick (&self) {
+            debug!("tick tock");
+            for node in self.nodes.values() {
+                let ref mut n = node.borrow_mut();
+                let ref mut raft: Raft<'a, _> = n.raft;
+                raft.tick();
+            }
+
+            assert!(self.leaders().len() <= 1);
+        }
+
+        fn process_messages (&self) {
+            for node in self.nodes.values() {
+                {
+                    let mut inner = node.borrow_mut();
+                    let append = inner.link.append.borrow();
+                    for (id, call) in append.iter() {
+                        trace!("resolving append {} => {}", inner.link.id, id);
+                        let request = call.request.clone();
+
+                        let mut other = self.nodes.get(id).unwrap().borrow_mut();
+
+                        call.resolve(Ok(other.raft.append_entries(request)));
+                    }
+                }
+
+                {
+                    let mut inner = node.borrow_mut();
+                    let votes = inner.link.vote.borrow();
+                    for (id, call) in votes.iter() {
+                        trace!("resolving vote {} => {}", inner.link.id, id);
+                        let request = call.request.clone();
+
+                        let mut other = self.nodes.get(id).unwrap().borrow_mut();
+
+                        call.resolve(Ok(other.raft.request_vote(request)));
+                    }
+                }
+
+                {
+                    let mut inner = node.borrow();
+                    *inner.link.vote.borrow_mut() = HashMap::new();
+                    *inner.link.append.borrow_mut() = HashMap::new();
+                }
+            }
+        }
+
+        fn leaders (&self) -> Vec<&'a String> {
+            self.nodes.values().flat_map(|n| {
+                let ref raft = n.borrow().raft;
+                if raft.role == Role::Leader {
+                    let x: &'a String = raft.cluster.id;
+                    Some(x)
+                } else {
+                    None
+                }
+            }).collect()
+        }
+
+        fn leader (&self) -> Option<&'a String> {
+            self.leaders().get(0).map(|id| *id)
+        }
+    }
+
+
+    fn single_node_cluster<'a> (id: &'a String) -> Cluster<'a> {
         Cluster {
-            id: "me".to_string(),
-            peers: vec!["other".to_string()]
+            id: &id,
+            peers: vec![&id]
+        }
+    }
+
+    #[test]
+    fn leader_elected () {
+        let _ = env_logger::try_init();
+        let a: String = "a".to_owned();
+        let b: String = "b".to_owned();
+        let c: String = "c".to_owned();
+        let ids: Vec<&String> = vec![&a, &b, &c];
+
+        {
+            let switch = Switchboard::new(ids);
+            {
+                let node = switch.nodes.get(&a).unwrap();
+                let ref mut raft = node.borrow_mut().raft;
+                raft.tick();
+                raft.tick();
+                raft.tick();
+            }
+
+            for _ in 0..100 {
+                switch.tick();
+                switch.process_messages();
+            }
+
+            assert!(switch.leader() != None);
         }
     }
 
     #[test]
     fn vote_granted () {
         let _ = env_logger::try_init();
-        let mut log: MemoryLog<u64> = MemoryLog::new();
+        let log: MemoryLog<u64> = MemoryLog::new();
         let link = NullLink::new();
         {
-            let mut raft: Raft<u64> = Raft::new(cluster(), &DEFAULT_CONFIG, &mut log, &link);
+            let id = "me".to_owned();
+            let cluster = single_node_cluster(&id);
+            let mut raft: Raft<u64> = Raft::new(cluster, &DEFAULT_CONFIG, Box::new(log.clone()), Box::new(link));
             let response = raft.request_vote(RequestVote {
                 term: 0,
                 candidate_id: "george michael".to_string(),
@@ -267,6 +492,6 @@ mod tests {
             });
             assert_eq!(response.vote_granted, true);
         }
-        assert_eq!(log.voted_for, Some("george michael".to_string()));
+        assert_eq!(log.get_voted_for(), Some("george michael".to_string()));
     }
 }

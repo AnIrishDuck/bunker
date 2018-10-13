@@ -5,13 +5,19 @@ extern crate tokio;
 extern crate futures;
 
 mod raft;
+/*
 extern crate rocket;
 extern crate rocksdb;
 
 use rocket::request::State;
 use rocksdb::DB;
 
-#[get("/log/<key>/<index>")]
+#[derive(Deserialize, StateData, StaticResponseExtender)]
+struct LogIndexExtractor {
+    key: String,
+    index: u64
+}
+
 fn get_log(db: State<DB>, key: String, index: u64) -> String {
     match db.get(&key.into_bytes()) {
         Ok(Some(value)) =>
@@ -34,10 +40,14 @@ static DATA_PATH: &'static str = "borneo.rocksdb";
 fn init_db() -> DB {
     DB::open_default(DATA_PATH).expect("opening database")
 }
+*/
 
 fn main() {
+    /*
     rocket::ignite()
         .mount("/", routes![get_log, put_log])
         .manage(init_db())
         .launch();
+    */
+    println!("hello cruel world!");
 }

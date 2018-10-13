@@ -23,13 +23,13 @@ impl<'a> State<'a> {
     }
 }
 
-pub fn become_candidate<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
+pub fn become_candidate<'a, 'b, Record: Debug> (raft: &'a mut Raft<'b, Record>) {
     info!("Becoming Candidate");
     raft.role = Role::Candidate;
     start_election(raft);
 }
 
-pub fn start_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
+pub fn start_election<'a, 'b, Record: Debug> (raft: &'a mut Raft<'b, Record>) {
     let term = raft.log.get_current_term() + 1;
     raft.log.set_current_term(term);
     trace!("starting new election, term {}", term);
@@ -40,16 +40,19 @@ pub fn start_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
     let ref cluster = raft.cluster;
 
     let ref mut election = state.candidate;
-    election.votes = HashSet::new();
-    election.votes.insert(&cluster.id);
     election.ticks = 0;
 
-    let link = raft.link;
+    let ref mut v: HashSet<&'b String> = election.votes;
+    *v = HashSet::new();
+    v.insert(&cluster.id);
+    raft.log.set_voted_for(Some(cluster.id.to_string()));
+
+    let link = &raft.link;
 
     election.pending = cluster.peers.iter().map(|id| {
         let response: Box<VoteResponse> = link.request_vote(id, RequestVote {
             candidate_id: cluster.id.to_string(),
-            last_log: last_log.clone(),
+            last_log: last_log.clone().unwrap_or(LogEntry { term: 0, index: 0 }),
             term: term
         });
 
@@ -57,7 +60,7 @@ pub fn start_election<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
     }).collect();
 }
 
-pub fn tick<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
+pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
     let (majority, timeout) = {
         let ref config = raft.config;
         let ref mut state = raft.volatile_state;
@@ -69,7 +72,7 @@ pub fn tick<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
             let id = p.id;
             match p.response.poll() {
                 Ok(Async::Ready(message)) => {
-                    trace!("rx vote: {:?}", message);
+                    trace!("response: {:?}", message);
                     if message.vote_granted {
                         election.votes.insert(&id);
                     }
@@ -101,50 +104,5 @@ pub fn tick<'a, Record: Debug> (raft: &'a mut Raft<'a, Record>) {
             debug!("election timed out, restarting");
             start_election(raft);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use super::log::MemoryLog;
-
-    extern crate env_logger;
-
-    fn cluster () -> Cluster {
-        Cluster {
-            id: "me".to_string(),
-            peers: vec!["other".to_string()]
-        }
-    }
-
-    fn boxed(raw: Vec<(u64, u64)>) -> Vec<(u64, Box<u64>)> {
-        raw.iter().map(|(t, v)| (*t, Box::new(*v))).collect()
-    }
-
-    fn unboxed(records: &Vec<(u64, Box<u64>)>) -> Vec<(u64, u64)> {
-        records.iter().map(|&(t, ref v)| (t, *v.clone())).collect()
-    }
-
-    #[test]
-    fn majority_election_succeeds() {
-        let _ = env_logger::try_init();
-        let mut log: MemoryLog<u64> = MemoryLog::new();
-        let link: NullLink = NullLink::new();
-        {
-            let mut raft: Raft<u64> = Raft::new(cluster(), &DEFAULT_CONFIG, &mut log, &link);
-
-            let response = raft.append_entries(AppendEntries {
-                term: 0,
-                previous_entry: LogEntry { term: 0, index: 0 },
-                entries: boxed(vec![(0, 1), (0, 2), (0, 3)]),
-                leader_commit: 10
-            });
-
-            assert_eq!(response.term, 0);
-            assert_eq!(response.success, true);
-            assert_eq!(raft.volatile_state.commit_index, 3);
-        }
-        assert_eq!(unboxed(&log.records), vec![(0, 1), (0, 2), (0, 3)]);
     }
 }
