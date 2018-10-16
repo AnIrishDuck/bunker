@@ -434,12 +434,7 @@ mod tests {
             }).collect();
 
             let switch = Switchboard::new(ids, refs);
-            drop(x);
-            drop(switch);
         }
-
-        // drop(switch);
-        drop(data);
     }
 
     #[test]
