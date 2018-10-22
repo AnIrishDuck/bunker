@@ -300,11 +300,11 @@ mod tests {
         String, RefCell<Call<Request, Response>>
     >;
 
-    struct SwitchLink<'a, Record: Debug + Clone> {
+    struct SwitchLink<'o, 'a> {
         id: String,
-        append: Incoming<AppendEntries<Record>, Append>,
+        append: Incoming<AppendEntries<u64>, Append>,
         vote: Incoming<RequestVote, Vote>,
-        switch: RefCell<Weak<Switchboard<'a, Record>>>
+        switch: RefCell<Weak<Switchboard<'o, 'a>>>
     }
 
     fn blank<Req, Res> (peers: &Vec<String>) -> Incoming<Req, Res> {
@@ -313,7 +313,7 @@ mod tests {
         }).collect()
     }
 
-    impl<'a, Record: Debug + Clone> SwitchLink<'a, Record> {
+    impl<'o, 'a: 'o> SwitchLink<'o, 'a> {
         fn new (id: &String, peers: &Vec<String>) -> Self {
             SwitchLink {
                 id: id.clone(),
@@ -323,14 +323,14 @@ mod tests {
             }
         }
 
-        fn node(&self, id: &String) -> Rc<Node<'a, Record>> {
+        fn node(&self, id: &String) -> Rc<Node<'o, 'a>> {
             let parent = self.switch.borrow().upgrade().unwrap();
             (*parent.nodes.get(id).unwrap()).clone()
         }
     }
 
-    impl<'a, Record: Debug + Clone + 'static> Link<Record> for SwitchLink<'a, Record> {
-        fn append_entries(&self, id: &String, r: AppendEntries<Record>) -> Box<AppendResponse> {
+    impl<'o, 'a> Link<u64> for SwitchLink<'o, 'a> {
+        fn append_entries(&self, id: &String, r: AppendEntries<u64>) -> Box<AppendResponse> {
             let peer = &self.node(id).link;
             let call = peer.append.get(&self.id).unwrap().borrow();
             call.request(r);
@@ -345,18 +345,18 @@ mod tests {
         }
     }
 
-    struct Node<'a, Record: Debug + Clone> {
-        raft: Raft<'a, Record>,
-        link: &'a SwitchLink<'a, Record>,
+    struct Node<'o, 'a: 'o> {
+        raft: Raft<'a, u64>,
+        link: &'o SwitchLink<'o, 'a>,
     }
 
-    struct Switchboard<'a, Record: Debug + Clone> {
-        nodes: HashMap<String, Rc<Node<'a, Record>>>,
+    struct Switchboard<'o, 'a> {
+        nodes: HashMap<String, Rc<Node<'o, 'a>>>,
         ids: Vec<String>
     }
 
-    impl<'a, Record: Debug + Clone + 'static> Switchboard<'a, Record> {
-        fn new (ids: Vec<String>, data: Vec<(String, &'a mut MemoryLog<Record>, &'a mut SwitchLink<'a, Record>)>) -> Rc<Self> {
+    impl<'o, 'a> Switchboard<'o, 'a> {
+        fn new (ids: Vec<String>, data: Vec<(String, &'a mut MemoryLog<u64>, &'o mut SwitchLink<'o, 'a>)>) -> Rc<Self> {
             let nodes = data.into_iter().map(|(id, log, link)| {
                 let cluster = Cluster {
                     id: id.to_string(),
@@ -390,7 +390,8 @@ mod tests {
         fn process_messages (&'a mut self) {
             for node in self.nodes.values_mut() {
                 let n = Rc::get_mut(node).unwrap();
-                let r: &'a mut Raft<'a, Record> = &mut n.raft;
+                let r: &'a mut Raft<'a, u64> = &mut n.raft;
+
                 for cell in n.link.append.values() {
                     let mut call = cell.borrow_mut();
                     let request = call.request.borrow().clone().unwrap();
@@ -421,7 +422,8 @@ mod tests {
             v.to_string()
         }).collect();
 
-        let mut data: Vec<(String, MemoryLog<u64>, SwitchLink<u64>)> = ids.iter().map(|id| {
+        /*
+        let mut data: Vec<(String, MemoryLog<u64>, SwitchLink)> = ids.iter().map(|id| {
             let log = MemoryLog::new();
             let link = SwitchLink::new(&id, &ids);
             (id.clone(), log, link)
@@ -434,6 +436,17 @@ mod tests {
             }).collect();
 
             let switch = Switchboard::new(ids, refs);
+        }
+        */
+
+        let id = "a".to_string();
+        let mut log = MemoryLog::new();
+
+        {
+            let link = SwitchLink::new(&id, &ids);
+            let switch = Switchboard::new(ids, vec![
+                (id.clone(), &mut log, &mut link)
+            ]);
         }
     }
 
