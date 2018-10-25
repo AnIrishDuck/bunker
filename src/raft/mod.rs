@@ -87,11 +87,13 @@ pub trait Link<Record> {
 pub enum Role { Follower, Candidate, Leader }
 
 pub struct Config {
-    election_restart_ticks: usize
+    election_restart_ticks: usize,
+    election_restart_jitter: usize
 }
 
 static DEFAULT_CONFIG: Config = Config {
-    election_restart_ticks: 10
+    election_restart_ticks: 10,
+    election_restart_jitter: 5
 };
 
 pub struct Raft<'a, Record: 'a> {
@@ -122,7 +124,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         }
     }
 
-    pub fn check_term(&mut self, message_term: u64) -> u64 {
+    pub fn check_term(&mut self, message_term: u64, append: bool) -> u64 {
         let term = self.log.get_current_term();
         // # Rules for Servers / All Servers
         // If RPC request or response contains term T > currentTerm:
@@ -132,10 +134,10 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         // If AppendEntries RPC received from new leader: convert to follower
         let candidate = self.role == Role::Candidate;
 
-        let election_lost = candidate && message_term == term;
+        let election_lost = candidate && message_term == term && append;
         if new_leader || election_lost {
             if new_leader {
-                trace!("following new leader with term {}", message_term);
+                trace!("reset with term {}", message_term);
             } else {
                 trace!("lost election for term {}", message_term);
             }
@@ -149,7 +151,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
     }
 
     pub fn append_entries (&mut self, request: AppendEntries<Record>) -> Append {
-        let current_term = self.check_term(request.term);
+        let current_term = self.check_term(request.term, true);
         let count = request.entries.len() as u64;
         debug!(
             "RX AppendEntries: {} at index {:?}",
@@ -168,7 +170,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
     }
 
     pub fn request_vote (&mut self, request: RequestVote) -> Vote {
-        let current_term = self.check_term(request.term);
+        let current_term = self.check_term(request.term, false);
 
         debug!("RX: {:?}", request);
         let vote_granted = if request.term < current_term { false } else {
@@ -189,7 +191,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
                 } else { request.last_log.term > last.term }
             }).unwrap_or(true);
 
-            prior_vote || log_current
+            prior_vote && log_current
         };
 
         if vote_granted {
@@ -459,13 +461,6 @@ mod tests {
 
         {
             let switch = Switchboard::new(ids);
-            {
-                let node = switch.nodes.get(&a).unwrap();
-                let ref mut raft = node.borrow_mut().raft;
-                raft.tick();
-                raft.tick();
-                raft.tick();
-            }
 
             for _ in 0..100 {
                 switch.tick();

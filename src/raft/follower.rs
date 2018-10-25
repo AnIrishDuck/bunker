@@ -12,6 +12,7 @@ impl State {
 
 pub fn become_follower<Record> (raft: &mut Raft<Record>) {
     raft.volatile_state.follower = State::new();
+    raft.log.set_voted_for(None);
     raft.role = Role::Follower;
 }
 

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use rand::prelude::*;
 use tokio::prelude::*;
 use raft::*;
 
@@ -39,8 +40,10 @@ pub fn start_election<'a, 'b, Record: Debug> (raft: &'a mut Raft<'b, Record>) {
     let ref mut state = raft.volatile_state;
     let ref cluster = raft.cluster;
 
+    let ref config = raft.config;
     let ref mut election = state.candidate;
-    election.ticks = 0;
+    let jitter = random::<usize>() % config.election_restart_jitter;
+    election.ticks = config.election_restart_ticks + jitter;
 
     let ref mut v: HashSet<&'b String> = election.votes;
     *v = HashSet::new();
@@ -62,11 +65,10 @@ pub fn start_election<'a, 'b, Record: Debug> (raft: &'a mut Raft<'b, Record>) {
 
 pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
     let (majority, timeout) = {
-        let ref config = raft.config;
         let ref mut state = raft.volatile_state;
         let ref mut election = state.candidate;
 
-        election.ticks += 1;
+        election.ticks -= 1;
 
         for p in &mut election.pending {
             let id = p.id;
@@ -85,7 +87,7 @@ pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
         let votes_received = election.votes.len();
         let quorum = (raft.cluster.peers.len() / 2) + 1;
         trace!(
-            "current votes received: {}, quorum: {}, ticks: {}",
+            "current votes received: {}, quorum: {}, ticks left: {}",
             votes_received,
             quorum,
             election.ticks
@@ -93,7 +95,7 @@ pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
 
         (
             votes_received > quorum,
-            election.ticks > config.election_restart_ticks
+            election.ticks == 0
         )
     };
 
