@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::cmp::max;
 use rand::prelude::*;
 use tokio::prelude::*;
 use raft::*;
@@ -64,6 +65,9 @@ pub fn start_election<'a, 'b, Record: Debug> (raft: &'a mut Raft<'b, Record>) {
 }
 
 pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
+    let term = raft.log.get_current_term();
+    let mut highest_term = 0;
+
     let (majority, timeout) = {
         let ref mut state = raft.volatile_state;
         let ref mut election = state.candidate;
@@ -74,6 +78,7 @@ pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
             let id = p.id;
             match p.response.poll() {
                 Ok(Async::Ready(message)) => {
+                    highest_term = max(highest_term, message.term);
                     trace!("response: {:?}", message);
                     if message.vote_granted {
                         election.votes.insert(&id);
@@ -99,7 +104,9 @@ pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
         )
     };
 
-    if majority {
+    if highest_term > term {
+        raft.check_term(highest_term, false);
+    } else if majority {
         leader::become_leader(raft);
     } else {
         if timeout {

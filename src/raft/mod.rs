@@ -359,7 +359,8 @@ mod tests {
     }
 
     struct Switchboard<'a> {
-        nodes: HashMap<String, RefCell<Node<'a>>>
+        nodes: HashMap<String, RefCell<Node<'a>>>,
+        tick: RefCell<u64>
     }
 
     fn others<'a> (id: &'a String, ids: &Vec<&'a String>) -> Vec<&'a String> {
@@ -395,12 +396,15 @@ mod tests {
             }).collect();
 
             Switchboard {
-                nodes: nodes
+                nodes: nodes,
+                tick: RefCell::new(0)
             }
         }
 
         fn tick (&self) {
-            debug!("tick tock");
+            let mut tick = self.tick.borrow_mut();
+            debug!("tick {}", tick);
+            *tick = *tick + 1;
             for node in self.nodes.values() {
                 let ref mut n = node.borrow_mut();
                 let ref mut raft: Raft<'a, _> = n.raft;
@@ -609,6 +613,77 @@ mod tests {
                 let log = node.log.record_vec();
                 assert_eq!(leader_log, log);
                 assert_eq!(node.raft.volatile_state.commit_count, final_index);
+            }
+        }
+    }
+
+    #[test]
+    fn unstable_cluster_progress () {
+        let _ = env_logger::try_init();
+        let a: String = "a".to_owned();
+        let b: String = "b".to_owned();
+        let c: String = "c".to_owned();
+        let ids: Vec<&String> = vec![&a, &b, &c];
+
+        {
+            let mut rng = thread_rng();
+            let switch = Switchboard::new(ids.clone());
+
+            for _ in 0..100 {
+                switch.tick();
+                switch.process_all_messages();
+            }
+
+            let mut flake = a.clone();
+            let mut final_index = 0;
+            for tick in 0..1000 {
+                let valid: Vec<_> = switch.leaders().into_iter().filter(|l|
+                    l.to_string() != flake
+                ).collect();
+                assert!(valid.len() <= 1);
+                if valid.len() == 1 {
+                    let leader_id = valid.get(0).unwrap().to_string();
+                    let mut leader = switch.nodes.get(&leader_id).unwrap().borrow_mut();
+
+                    if tick % 100 == 42 {
+                        let count = random::<u64>() % 10;
+                        info!("proposing {}", count);
+                        for i in 0..count {
+                            let committed = leader.raft.propose(Box::new(i)).unwrap();
+                        }
+                    }
+
+                    let official = leader.raft.volatile_state.commit_count;
+                    trace!("official {} prior {}", official, final_index);
+                    final_index = official;
+                }
+
+                if tick % 100 == 84 {
+                    flake = rng.choose(&ids).unwrap().to_string();
+                    trace!("disconnecting {}", flake);
+                }
+
+                switch.tick();
+                switch.process_messages(&ignore_one(flake.clone()));
+            }
+
+            info!("pencils down, time to recover {}", flake);
+            for _ in 0..200 {
+                switch.tick();
+                switch.process_all_messages();
+            }
+
+            let leader_log = {
+                let leader_id = switch.leader().unwrap();
+                let mut leader = switch.nodes.get(leader_id).unwrap().borrow_mut();
+
+                leader.log.record_vec()
+            };
+
+            for cell in switch.nodes.values() {
+                let node = cell.borrow();
+                let log = node.log.record_vec();
+                assert_eq!(leader_log, log);
             }
         }
     }

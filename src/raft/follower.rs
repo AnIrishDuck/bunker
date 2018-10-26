@@ -44,7 +44,7 @@ pub fn append_entries<Record> (raft: &mut Raft<Record>, request: AppendEntries<R
             trace!("Prior entry term: {}", check_term);
             check_term != entry.term
         }).unwrap_or(true)
-    }).unwrap_or(my_count != 0);
+    }).unwrap_or(false);
 
     let success = if request_from_prior_term || inconsistent {
         false
