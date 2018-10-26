@@ -1,11 +1,14 @@
-use std::cmp::{min, max};
+use std::cmp::max;
 use tokio::prelude::*;
 use raft::*;
 
 struct Follower<'a> {
     id: &'a String,
+    sent: usize,
     next_index: u64,
-    match_index: u64,
+    // note: we stray slightly from the spec here. a "match index" might not
+    // exist for the first leader when no followers have matching values.
+    match_count: u64,
     pending: Option<Box<AppendResponse>>
 }
 
@@ -28,8 +31,9 @@ pub fn become_leader<'a, Record> (raft: &mut Raft<'a, Record>) {
     let followers = raft.cluster.peers.iter().map(|id| {
         Follower {
             id: id,
-            next_index: raft.volatile_state.commit_index + 1,
-            match_index: 0,
+            sent: 0,
+            next_index: raft.volatile_state.commit_count,
+            match_count: 0,
             pending: None
         }
     }).collect();
@@ -49,14 +53,18 @@ pub fn tick<'a, Record> (raft: &mut Raft<'a, Record>) {
                         Ok(Async::NotReady) => false,
                         Ok(Async::Ready(append)) => {
                             if append.success {
-                                follower.match_index = follower.next_index;
+                                let sent = follower.sent as u64;
+                                follower.match_count = follower.next_index + 1;
+                                follower.next_index += sent;
                                 trace!(
-                                    "appended to {} (now at {})",
+                                    "appended to {} (count {}, next index {})",
                                     follower.id,
+                                    follower.match_count,
                                     follower.next_index
                                 );
                             } else {
-                                follower.next_index = min(0, follower.next_index - 1);
+                                assert!(follower.next_index > 0);
+                                follower.next_index -= 1;
                                 trace!(
                                     "{} rejected append, rewinding (now at {})",
                                     follower.id,
@@ -75,29 +83,56 @@ pub fn tick<'a, Record> (raft: &mut Raft<'a, Record>) {
             };
 
             if send_more {
-                let missing_entries = raft.log.get_index() <= follower.next_index;
+                let my_count = raft.log.get_count();
+                let missing_entries = follower.next_index < my_count;
+
                 let (prior, records) = if missing_entries {
-                    let entry = raft.log.get_entry(follower.next_index);
-                    let term = entry.map(|(t, _)| t).unwrap_or(0);
+                    let prior_index = if follower.next_index > 0 {
+                        Some(follower.next_index - 1)
+                    } else {
+                        None
+                    };
+
+                    let prior_entry = match prior_index {
+                        Some(index) => {
+                            let entry = raft.log.get_entry(follower.next_index);
+                            match entry {
+                                Some((entry_term, _)) =>
+                                    Some(LogEntry {
+                                        index: index,
+                                        term: entry_term
+                                    }),
+                                None => {
+                                    Some(LogEntry {
+                                        index: index,
+                                        term: term
+                                    })
+                                }
+                            }
+                        },
+                        None => None
+                    };
+
                     (
-                        LogEntry { index: follower.next_index, term: term },
+                        prior_entry,
                         raft.log.get_batch(follower.next_index)
                     )
-                } else { (LogEntry { index: 0, term: 0}, vec![]) };
+                } else { (None, vec![]) };
 
-                let count = records.len();
+                follower.sent = records.len();
                 trace!(
-                    "sending {} to {} (at {:?})",
-                    count,
+                    "sending {} to {} (prior {:?}, follower has {})",
+                    follower.sent,
                     follower.id,
-                    prior
+                    prior,
+                    follower.next_index
                 );
 
                 let response = raft.link.append_entries(follower.id, AppendEntries {
                     term: term,
                     previous_entry: prior,
                     entries: records,
-                    leader_commit: raft.volatile_state.commit_index
+                    leader_commit: raft.volatile_state.commit_count
                 });
 
                 follower.pending = Some(response);
@@ -108,19 +143,22 @@ pub fn tick<'a, Record> (raft: &mut Raft<'a, Record>) {
     {
         let ref leader = raft.volatile_state.leader;
         let mut matches: Vec<u64> = leader.followers.iter().map(|follower| {
-            let entry = raft.log.get_entry(follower.match_index);
-            if entry.map(|(t, _)| t).unwrap_or(0) == term {
-                follower.match_index
-            } else { 0 }
+            count_to_index(follower.match_count).map(|index| {
+                let entry = raft.log.get_entry(index);
+                if entry.map(|(t, _)| t).unwrap_or(0) == term {
+                    follower.match_count
+                } else { 0 }
+            }).unwrap_or(0)
         }).collect();
         matches.sort_unstable();
 
 
-        let ref mut commit = raft.volatile_state.commit_index;
-        let middle = (matches.len() / 2) + if matches.len() % 2 == 0 { 0 } else { 1 };
+        let ref mut commit = raft.volatile_state.commit_count;
+        let shift = if matches.len() % 2 == 0 { 0 } else { 1 };
+        let middle = (matches.len() / 2) - shift;
         let next_commit = max(matches[middle], *commit);
 
-        trace!("follower indices: {:?}; next commit: {}", matches, commit);
+        trace!("follower counts: {:?}; consensus count: {}", matches, commit);
         *commit = next_commit;
     }
 }

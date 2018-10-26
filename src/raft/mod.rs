@@ -15,7 +15,7 @@ pub trait Log<Record> {
     fn get_voted_for (&self) -> Option<String>;
     fn set_voted_for (&mut self, candidate: Option<String>);
 
-    fn get_index (&self) -> u64;
+    fn get_count (&self) -> u64;
     fn get_entry (&self, index: u64) -> Option<(u64, Box<Record>)>;
     fn insert (&mut self, index: u64, records: Vec<(u64, Box<Record>)>);
 
@@ -26,8 +26,14 @@ pub trait StateMachine<Record> {
     fn apply (record: Box<Record>) -> bool;
 }
 
+pub fn count_to_index(count: u64) -> Option<u64> {
+    if count > 0 { Some(count - 1) } else { None }
+}
+
 pub struct VolatileState<'a> {
-    commit_index: u64,
+    // note: we stray slightly from the spec here. a "commit index" might not
+    // exist in the startup state where no values have been proposed.
+    commit_count: u64,
     // we will track last_applied in the state machine
     candidate: candidate::State<'a>,
     leader: leader::State<'a>,
@@ -49,7 +55,9 @@ pub struct LogEntry {
 pub struct AppendEntries<Record> {
     term: u64,
     // we never ended up needing leader_id
-    previous_entry: LogEntry,
+    // we deviate from the spec here for clarity: there might be no prior entry
+    // so we might not have anything to synchronize with
+    previous_entry: Option<LogEntry>,
     entries: Vec<(u64, Box<Record>)>,
     leader_commit: u64
 }
@@ -109,7 +117,7 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
     pub fn new (cluster: Cluster<'a>, config: &'a Config, log: Box<Log<Record> + 'a>, link: Box<Link<Record> + 'a>) -> Self {
         let volatile = VolatileState {
             candidate: candidate::State::new(),
-            commit_index: 0,
+            commit_count: 0,
             follower: follower::State::new(),
             leader: leader::State::new()
         };
@@ -206,16 +214,25 @@ impl<'a, Record: Debug + 'a> Raft<'a, Record> {
         response
     }
 
-    fn get_last_log_entry<'b> (&'b mut self) -> Option<LogEntry> {
-        let index = self.log.get_index();
+    fn propose (&mut self, r: Box<Record>) -> Option<u64> {
+        match self.role {
+            Role::Leader => {
+                let term = self.log.get_current_term();
+                let count = self.log.get_count();
+                self.log.insert(count, vec![(term, r)]);
+                Some(count + 1)
+            },
+            _ => None
+        }
+    }
 
-        if index > 0 {
-            self.log.get_entry(index - 1).map(|(term, _)| {
+    fn get_last_log_entry<'b> (&'b mut self) -> Option<LogEntry> {
+        let final_index = count_to_index(self.log.get_count());
+        final_index.and_then(|index| {
+            self.log.get_entry(index).map(|(term, _)| {
                 LogEntry { index: index, term: term }
             })
-        } else {
-            None
-        }
+        })
     }
 
     fn tick (&mut self) {
@@ -336,7 +353,8 @@ mod tests {
 
     struct Node<'a> {
         raft: Raft<'a, u64>,
-        link: SwitchLink
+        link: SwitchLink,
+        log: MemoryLog<u64>
     }
 
     struct Switchboard<'a> {
@@ -359,13 +377,14 @@ mod tests {
                 let raft = Raft::new(
                     cluster,
                     &DEFAULT_CONFIG,
-                    Box::new(log),
+                    Box::new(log.clone()),
                     Box::new(link.clone())
                 );
 
                 let n: Node<'a> = Node {
                     raft: raft,
                     link: link,
+                    log: log
                 };
 
                 (
@@ -468,6 +487,52 @@ mod tests {
             }
 
             assert!(switch.leader() != None);
+        }
+    }
+
+    #[test]
+    fn cluster_follows () {
+        let _ = env_logger::try_init();
+        let a: String = "a".to_owned();
+        let b: String = "b".to_owned();
+        let c: String = "c".to_owned();
+        let ids: Vec<&String> = vec![&a, &b, &c];
+
+        {
+            let switch = Switchboard::new(ids);
+
+            for _ in 0..100 {
+                switch.tick();
+                switch.process_messages();
+            }
+
+            let mut final_index = 0;
+            let leader_log = {
+                let leader_id = switch.leader().unwrap();
+                let mut leader = switch.nodes.get(leader_id).unwrap().borrow_mut();
+
+                for i in 0..47 {
+                    let committed = leader.raft.propose(Box::new(i)).unwrap();
+                    assert!(committed >= final_index);
+                    final_index = committed;
+                }
+
+                leader.log.record_vec()
+            };
+
+            info!("proposal complete");
+
+            for _ in 0..20 {
+                switch.tick();
+                switch.process_messages();
+            }
+
+            for cell in switch.nodes.values() {
+                let node = cell.borrow();
+                let log = node.log.record_vec();
+                assert_eq!(leader_log, log);
+                assert_eq!(node.raft.volatile_state.commit_count, final_index);
+            }
         }
     }
 
