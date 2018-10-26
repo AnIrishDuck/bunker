@@ -63,8 +63,10 @@ pub fn tick<'a, Record> (raft: &mut Raft<'a, Record>) {
                                     follower.next_index
                                 );
                             } else {
-                                assert!(follower.next_index > 0);
-                                follower.next_index -= 1;
+                                if follower.next_index > 0 {
+                                    follower.next_index -= 1;
+                                }
+
                                 trace!(
                                     "{} rejected append, rewinding (now at {})",
                                     follower.id,

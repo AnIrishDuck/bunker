@@ -267,7 +267,8 @@ impl<Record> Link<Record> for NullLink {
 mod tests {
     use super::*;
     use super::log::MemoryLog;
-    use std::collections::HashMap;
+    use rand::prelude::*;
+    use std::collections::{HashMap, HashSet};
     use std::cell::RefCell;
     use std::rc::Rc;
     use tokio::prelude::*;
@@ -406,21 +407,42 @@ mod tests {
                 raft.tick();
             }
 
-            assert!(self.leaders().len() <= 1);
+            // Election Safety: at most one leader can be elected in a given
+            // term. §5.2
+            let leaders = self.leaders();
+            let leader_count = leaders.len();
+            let term_set: HashSet<_> = leaders.into_iter().map(|id|
+                self.nodes.get(id).unwrap().borrow().log.get_current_term()
+            ).collect();
+            assert!(term_set.len() == leader_count);
         }
 
-        fn process_messages (&self) {
+        fn process_all_messages(&self) {
+            let always: Box<Fn(String, String) -> bool> = Box::new(|_, _| true);
+            self.process_messages(&always)
+        }
+
+        fn process_messages (&self, arbiter: &Box<Fn(String, String) -> bool>) {
+
             for node in self.nodes.values() {
                 {
                     let mut inner = node.borrow_mut();
                     let append = inner.link.append.borrow();
                     for (id, call) in append.iter() {
-                        trace!("resolving append {} => {}", inner.link.id, id);
+                        let rx = id;
+                        let tx = &inner.link.id;
                         let request = call.request.clone();
 
                         let mut other = self.nodes.get(id).unwrap().borrow_mut();
 
-                        call.resolve(Ok(other.raft.append_entries(request)));
+                        let result = if arbiter(tx.clone(), rx.clone()) {
+                            trace!("resolving append {} => {}", tx, rx);
+                            Ok(other.raft.append_entries(request))
+                        } else {
+                            trace!("rejecting append {} => {}", tx, rx);
+                            Err("rejection hurts".to_owned())
+                        };
+                        call.resolve(result);
                     }
                 }
 
@@ -428,12 +450,21 @@ mod tests {
                     let mut inner = node.borrow_mut();
                     let votes = inner.link.vote.borrow();
                     for (id, call) in votes.iter() {
-                        trace!("resolving vote {} => {}", inner.link.id, id);
+                        let rx = id;
+                        let tx = &inner.link.id;
                         let request = call.request.clone();
 
                         let mut other = self.nodes.get(id).unwrap().borrow_mut();
 
-                        call.resolve(Ok(other.raft.request_vote(request)));
+
+                        let result = if arbiter(tx.clone(), rx.clone()) {
+                            trace!("resolving vote {} => {}", tx, rx);
+                            Ok(other.raft.request_vote(request))
+                        } else {
+                            trace!("rejecting vote {} => {}", tx, rx);
+                            Err("rejection hurts".to_owned())
+                        };
+                        call.resolve(result);
                     }
                 }
 
@@ -470,6 +501,15 @@ mod tests {
         }
     }
 
+    fn ignore(ids: HashSet<String>) -> Box<Fn(String, String) -> bool> {
+        Box::new(move |a, b| !ids.contains(&a) && !ids.contains(&b))
+    }
+
+    fn ignore_one(flake: String) -> Box<Fn(String, String) -> bool> {
+        let flakes = vec![flake.to_string()].into_iter().collect();
+        ignore(flakes)
+    }
+
     #[test]
     fn leader_elected () {
         let _ = env_logger::try_init();
@@ -483,10 +523,47 @@ mod tests {
 
             for _ in 0..100 {
                 switch.tick();
-                switch.process_messages();
+                switch.process_all_messages();
             }
 
             assert!(switch.leader() != None);
+        }
+    }
+
+    #[test]
+    fn leader_stability () {
+        let _ = env_logger::try_init();
+        let a: String = "a".to_owned();
+        let b: String = "b".to_owned();
+        let c: String = "c".to_owned();
+        let ids: Vec<&String> = vec![&a, &b, &c];
+
+        {
+            let switch = Switchboard::new(ids.clone());
+
+            let mut rng = thread_rng();
+            let mut flake = a.clone();
+
+            let mut stable_ticks = 0;
+            for tick in 0..1000 {
+                if tick % 50 == 0 {
+                    flake = rng.choose(&ids).unwrap().to_string();
+                    trace!("disconnecting {}", flake);
+                }
+                switch.tick();
+                switch.process_messages(&ignore_one(flake.clone()));
+
+                let valid: Vec<_> = switch.leaders().into_iter().filter(|l|
+                    l.to_string() != flake
+                ).collect();
+                assert!(valid.len() <= 1);
+                if valid.len() == 1 {
+                    stable_ticks += 1;
+                }
+            }
+
+            trace!("stable for {}", stable_ticks);
+            assert!(stable_ticks > 900);
         }
     }
 
@@ -503,7 +580,7 @@ mod tests {
 
             for _ in 0..100 {
                 switch.tick();
-                switch.process_messages();
+                switch.process_all_messages();
             }
 
             let mut final_index = 0;
@@ -522,9 +599,9 @@ mod tests {
 
             info!("proposal complete");
 
-            for _ in 0..20 {
+            for _ in 0..50 {
                 switch.tick();
-                switch.process_messages();
+                switch.process_all_messages();
             }
 
             for cell in switch.nodes.values() {

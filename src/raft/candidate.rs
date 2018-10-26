@@ -94,7 +94,7 @@ pub fn tick<'a, Record: Debug> (raft: &mut Raft<'a, Record>) {
         );
 
         (
-            votes_received > quorum,
+            votes_received >= quorum,
             election.ticks == 0
         )
     };
