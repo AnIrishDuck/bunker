@@ -44,7 +44,6 @@ impl Segment {
         let schema = Arc::new(parse_message_type(message_type).unwrap());
         let props = Arc::new(WriterProperties::builder().build());
 
-        dbg!(&self.path);
         let file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -74,14 +73,21 @@ pub(crate) struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    pub(crate) fn log(&mut self, record: Record) {
+    pub(crate) fn log(&mut self, mut record: Vec<Record>) {
         let mut row_group_writer = self.writer.next_row_group().unwrap();
+
+        let mut times = vec![];
+        let mut messages = vec![];
+        for r in record.drain(..) {
+            let dt = r.time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            times.push(dt.as_millis().try_into().unwrap());
+            messages.push(r.message);
+        }
+
         if let Some(mut col_writer) = row_group_writer.next_column().unwrap() {
-            let dt = record.time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-            let v: i64 = dt.as_millis().try_into().unwrap();
             match col_writer {
                 ColumnWriter::Int64ColumnWriter(ref mut typed_writer) => {
-                    typed_writer.write_batch(&[v], None, None).unwrap();
+                    typed_writer.write_batch(&times, None, None).unwrap();
                 }
                 _ => panic!("invalid column type"),
             };
@@ -91,9 +97,7 @@ impl SegmentWriter {
         if let Some(mut col_writer) = row_group_writer.next_column().unwrap() {
             match col_writer {
                 ColumnWriter::ByteArrayColumnWriter(ref mut typed_writer) => {
-                    typed_writer
-                        .write_batch(&[record.message], None, None)
-                        .unwrap();
+                    typed_writer.write_batch(&messages, None, None).unwrap();
                 }
                 _ => panic!("invalid column type"),
             };
@@ -103,14 +107,12 @@ impl SegmentWriter {
     }
 
     pub(crate) fn sync(&mut self) -> io::Result<()> {
-        dbg!("sync", &self.path);
         // TODO: validate there's no stored data within the SerializedFileWriter that needs to be flushed
         self.file.sync_data()
     }
 
     pub(crate) fn close(mut self) {
         self.writer.close().unwrap();
-        dbg!("close", &self.path);
         self.sync().unwrap();
     }
 }
@@ -189,7 +191,7 @@ mod test {
 
         let mut w = s.create();
         for r in records.iter() {
-            w.log(r.clone());
+            w.log(vec![r.clone()]);
             w.sync().unwrap();
         }
         w.close();

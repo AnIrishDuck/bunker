@@ -4,6 +4,7 @@ use warp::Filter;
 mod segment;
 mod slog;
 mod topic;
+mod topic_state;
 
 #[tokio::main]
 async fn main() {

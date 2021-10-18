@@ -42,13 +42,10 @@ impl Slog {
     }
 
     pub(crate) fn get_record(&self, ix: Index) -> Option<Record> {
-        dbg!(self.current);
         assert!(ix.segment <= self.current);
         if ix.segment == self.current {
-            dbg!("pending-get");
             self.pending.get(ix.record).cloned()
         } else {
-            dbg!("stored-get", self.get_segment(ix.segment).path());
             self.get_segment(ix.segment)
                 .read()
                 .read_all()
@@ -95,8 +92,9 @@ impl Slog {
     }
 
     pub(crate) fn roll(&mut self) -> () {
+        self.writer
+            .log(std::mem::replace(&mut self.pending, vec![]));
         self.pending_size = 0;
-        self.pending = vec![];
         self.time_range = None;
         self.current += 1;
         let new_writer = self.get_segment(self.current).create();

@@ -1,17 +1,21 @@
 use crate::segment::Record;
 use crate::slog::{Index, Slog};
+use crate::topic_state::TopicState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs;
 use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SegmentSpan {
-    time: RangeInclusive<SystemTime>,
-    index: Range<u128>,
+pub struct SegmentSpan<R>
+where
+    R: Clone + RangeBounds<u128>,
+{
+    pub time: RangeInclusive<SystemTime>,
+    pub index: R,
 }
 
 struct Retention {
@@ -31,10 +35,9 @@ impl Retention {
 struct Topic {
     name: String,
     messages: Slog,
-    indices: Indices,
+    state: TopicState,
     last_roll: Instant,
     retain: Retention,
-    state: State,
 }
 
 struct Indices {
@@ -52,7 +55,7 @@ impl Indices {
         }
     }
 
-    fn update(&mut self, segment_ix: usize, ixs: &SegmentSpan) {
+    fn update(&mut self, segment_ix: usize, ixs: &SegmentSpan<Range<u128>>) {
         let t = *ixs.time.start();
         let v = self.by_start_time.entry(t).or_insert(vec![]);
         v.push(segment_ix);
@@ -67,36 +70,18 @@ impl Indices {
 
 #[derive(Serialize, Deserialize)]
 struct State {
-    spans: Vec<SegmentSpan>,
+    spans: Vec<SegmentSpan<Range<u128>>>,
 }
 
 impl Topic {
     fn attach(name: String, retain: Retention) -> Self {
         let path = Topic::named_state_path(&name);
-        let (state, messages, indices) = if Path::new(&path).exists() {
-            let file = fs::File::open(path).unwrap();
-            let state: State = serde_json::from_reader(file).unwrap();
-            let messages = Slog::attach(name.clone(), state.spans.len());
-            let mut indices = Indices::new();
-            for (ix, span) in state.spans.iter().enumerate() {
-                indices.update(ix, span);
-            }
-            dbg!("read state", &state.spans);
-            dbg!("indices", &indices.by_start_ix);
-            (state, messages, indices)
-        } else {
-            dbg!("creating");
-            (
-                State { spans: vec![] },
-                Slog::attach(name.clone(), 0),
-                Indices::new(),
-            )
-        };
+        let state = TopicState::attach(PathBuf::from(path));
+        let messages = Slog::attach(name.clone(), state.get_active_segment().unwrap_or(0));
 
         Topic {
             name,
             messages,
-            indices,
             last_roll: Instant::now(),
             retain,
             state,
@@ -108,14 +93,11 @@ impl Topic {
         let size = u128::try_from(self.messages.current_len()).unwrap();
         let span = SegmentSpan {
             time,
-            index: (start..start + size),
+            index: start..start + size,
         };
-        self.indices
-            .update(self.messages.current_segment_ix(), &span);
-        self.state.spans.push(span);
+        self.state.update(self.messages.current_segment_ix(), &span);
         self.last_roll = Instant::now();
         self.messages.roll();
-        self.sync_state();
     }
 
     fn roll_when_needed(&mut self) {
@@ -137,7 +119,14 @@ impl Topic {
     }
 
     fn open_index(&self) -> u128 {
-        self.state.spans.last().map(|r| r.index.end).unwrap_or(0)
+        self.state
+            .get_active_segment()
+            .and_then(|segment_ix| {
+                self.state
+                    .get_segment_span(segment_ix - 1)
+                    .map(|span| span.index.end)
+            })
+            .unwrap_or(0)
     }
 
     fn append(&mut self, r: Record) -> u128 {
@@ -147,24 +136,11 @@ impl Topic {
     }
 
     fn named_state_path(name: &str) -> String {
-        format!("{}.json", name)
+        format!("{}-meta.sqlite", name)
     }
 
     fn state_path(&self) -> String {
         Topic::named_state_path(&self.name)
-    }
-
-    fn sync_state(&mut self) {
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(self.state_path())
-            .unwrap();
-
-        let open = self.open_index();
-        serde_json::to_writer_pretty(&file, &self.state).unwrap();
-        file.sync_data().unwrap();
     }
 
     fn get_record_by_index(&self, index: u128) -> Option<Record> {
@@ -172,63 +148,21 @@ impl Topic {
         let slog_index = if index >= open {
             Some(Index {
                 record: usize::try_from(index - open).unwrap(),
-                segment: self.state.spans.len(),
+                segment: self.state.get_active_segment().unwrap_or(0),
             })
         } else {
-            self.indices
-                .by_start_ix
-                .range(..=index)
-                .last()
-                .map(|(start, segment)| {
-                    let segment = segment.clone();
+            self.state
+                .get_segment_for_ix(u64::try_from(index).unwrap())
+                .map(|segment| {
+                    let span = self.state.get_segment_span(segment).unwrap();
                     Index {
-                        record: usize::try_from(index - start).unwrap(),
+                        record: usize::try_from(index - span.index.start).unwrap(),
                         segment,
                     }
                 })
         };
-        dbg!(&slog_index);
 
         slog_index.and_then(|ix| self.messages.get_record(ix))
-    }
-
-    fn get_records_by_time<R>(&self, query: R) -> Vec<Record>
-    where
-        R: RangeBounds<SystemTime> + Clone,
-    {
-        // all segments where the end is after the start of our range
-        let start_range = (Bound::Unbounded, query.end_bound());
-        let end_during = self
-            .indices
-            .by_end_time
-            .range(start_range)
-            .flat_map(|(_, segments)| segments.iter().cloned());
-
-        // all segments where the start is before the end of our range, that weren't previously enumerated.
-        let start_during = self
-            .indices
-            .by_start_time
-            .range((Bound::Unbounded, query.end_bound()))
-            .flat_map(|(_, segments)| segments.iter().cloned())
-            .filter(|segment| {
-                self.state
-                    .spans
-                    .get(*segment)
-                    .map(|span| !start_range.contains(span.time.end()))
-                    .unwrap_or(false)
-            });
-
-        end_during
-            .chain(start_during)
-            .flat_map(|segment| {
-                self.messages
-                    .get_segment(segment.clone())
-                    .read()
-                    .read_all()
-                    .into_iter()
-                    .filter(|r| query.contains(&r.time))
-            })
-            .collect()
     }
 
     fn close(mut self) {
@@ -236,7 +170,6 @@ impl Topic {
         if let Some(time) = range {
             self.roll(time);
         }
-        self.sync_state();
         // TODO order of operations is wrong here, due to ownership issues
         self.messages.close();
     }
@@ -245,6 +178,8 @@ impl Topic {
 mod test {
     use super::*;
     use parquet::data_type::ByteArray;
+    use std::sync::mpsc::channel;
+    use std::thread;
 
     #[test]
     fn test_append_get() {
@@ -354,6 +289,72 @@ mod test {
                 t.get_record_by_index(u128::try_from(records.len()).unwrap()),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn test_bench() {
+        let partitions = 1;
+        let sample = 4 * 1000;
+        let total = sample * 2;
+
+        let mut handles = vec![];
+        let (otx, rx) = channel();
+        for part in 0..partitions {
+            let tx = otx.clone();
+            let handle = thread::spawn(move || {
+                let mut t = Topic::attach(format!("testing-{}", part), Retention::DEFAULT);
+
+                let seed = 0..sample;
+                let records: Vec<_> = seed
+                    .clone()
+                    .into_iter()
+                    .map(|message| Record {
+                        time: SystemTime::UNIX_EPOCH,
+                        message: ByteArray::from(format!("benchmark-{}", message).as_str()),
+                    })
+                    .collect();
+
+                let mut prev = None;
+                for (ix, record) in records.iter().cycle().take(total).enumerate() {
+                    let mut r = record.clone();
+                    r.time = SystemTime::now();
+                    t.append(r);
+                    if ix % 1000 == 0 {
+                        if let Some(prev_ix) = prev {
+                            tx.send(ix - prev_ix).unwrap();
+                        }
+                        prev = Some(ix);
+                    }
+                }
+                t.close();
+                tx.send(total - prev.unwrap_or(0)).unwrap();
+            });
+            handles.push(handle);
+        }
+
+        let start = Instant::now();
+        let mut written = 0;
+        while written < total * partitions {
+            written += rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            println!(
+                "{}/{} elapsed: {}ms",
+                written,
+                total * partitions,
+                (Instant::now() - start).as_millis()
+            );
+        }
+        let elapsed_ms = (Instant::now() - start).as_millis();
+        println!(
+            "written: {} / elapsed: {}ms ({:.2}kw/s)",
+            written,
+            elapsed_ms,
+            f64::from(i32::try_from(written).unwrap())
+                / f64::from(i32::try_from(elapsed_ms).unwrap())
+        );
+
+        for handle in handles {
+            handle.join().unwrap();
         }
     }
 }
