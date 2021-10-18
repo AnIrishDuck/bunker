@@ -2,16 +2,18 @@ use crate::segment::{Record, Segment, SegmentWriter};
 use std::cmp::{max, min};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread::{spawn, JoinHandle};
 use std::time::SystemTime;
 
 /// A slog (segment log) is a named and ordered series of segments.
 pub(crate) struct Slog {
     name: String,
     current: usize,
-    writer: SegmentWriter,
     pending: Vec<Record>,
     pending_size: usize,
     time_range: Option<RangeInclusive<SystemTime>>,
+    writer: SlogThreadControl,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +24,7 @@ pub struct Index {
 
 impl Slog {
     pub fn attach(name: String, current: usize) -> Self {
-        let writer = Slog::segment_from_name(&name, current).create();
+        let writer = SlogThread::spawn(name.clone(), current);
         Slog {
             name,
             current,
@@ -63,16 +65,10 @@ impl Slog {
             .clone()
             .map(|range| (min(*range.start(), r.time)..=max(*range.end(), r.time)))
             .or(Some(r.time..=r.time));
-        dbg!(self.current, &r);
-        self.writer.log(r);
         Index {
             segment: self.current,
             record,
         }
-    }
-
-    pub(crate) fn sync(&mut self) -> () {
-        self.writer.sync().unwrap()
     }
 
     pub(crate) fn current_segment_ix(&self) -> usize {
@@ -92,17 +88,91 @@ impl Slog {
     }
 
     pub(crate) fn roll(&mut self) -> () {
-        self.writer
-            .log(std::mem::replace(&mut self.pending, vec![]));
+        if !self
+            .writer
+            .try_send(std::mem::replace(&mut self.pending, vec![]))
+        {
+            panic!("log overrun")
+        }
         self.pending_size = 0;
         self.time_range = None;
         self.current += 1;
-        let new_writer = self.get_segment(self.current).create();
-        let old = std::mem::replace(&mut self.writer, new_writer);
-        old.close();
     }
 
-    pub(crate) fn close(self) -> () {
-        self.writer.close()
+    pub(crate) fn commit(&mut self) {
+        self.writer.commit();
+    }
+}
+
+struct SlogThread {
+    writer: SegmentWriter,
+}
+
+enum SlogThreadMessage {
+    Write(Vec<Record>),
+    Close,
+}
+
+struct SlogThreadControl {
+    write_handle: JoinHandle<()>,
+    ready: bool,
+    tx: mpsc::Sender<SlogThreadMessage>,
+    rx: mpsc::Receiver<()>,
+}
+
+impl SlogThreadControl {
+    fn try_send(&mut self, rs: Vec<Record>) -> bool {
+        if !self.ready {
+            match self.rx.try_recv() {
+                Ok(()) => self.ready = true,
+                Err(_) => return false,
+            }
+        }
+        self.tx.send(SlogThreadMessage::Write(rs));
+        self.ready = false;
+        true
+    }
+
+    fn commit(&mut self) {
+        if !self.ready {
+            self.rx.recv().unwrap();
+            self.ready = true;
+        }
+    }
+}
+
+impl Drop for SlogThreadControl {
+    fn drop(&mut self) {
+        self.tx.send(SlogThreadMessage::Close);
+    }
+}
+
+impl SlogThread {
+    fn spawn(name: String, mut current: usize) -> SlogThreadControl {
+        let (tx, rx_records) = mpsc::channel();
+        let (tx_done, rx) = mpsc::channel();
+
+        let write_handle = spawn(move || {
+            let mut active = true;
+            while active {
+                let mut segment = Slog::segment_from_name(&name, current).create();
+                match rx_records.recv().unwrap() {
+                    SlogThreadMessage::Write(rs) => {
+                        segment.log(rs);
+                        segment.close();
+                        tx_done.send(()).unwrap();
+                        current += 1;
+                    }
+                    SlogThreadMessage::Close => active = false,
+                }
+            }
+        });
+
+        SlogThreadControl {
+            write_handle,
+            ready: true,
+            tx,
+            rx,
+        }
     }
 }

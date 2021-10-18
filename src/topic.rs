@@ -165,13 +165,15 @@ impl Topic {
         slog_index.and_then(|ix| self.messages.get_record(ix))
     }
 
-    fn close(mut self) {
+    fn commit(&mut self) {
         let range = self.messages.current_time_range();
         if let Some(time) = range {
+            // TODO order of operations is wonky here, first commit clears any pending roll,
+            // then roll is forced, then next commit waits for that roll to complete.
+            self.messages.commit();
             self.roll(time);
+            self.messages.commit();
         }
-        // TODO order of operations is wrong here, due to ownership issues
-        self.messages.close();
     }
 }
 
@@ -231,6 +233,7 @@ mod test {
         for record in records.iter() {
             t.append(record.clone());
         }
+        t.commit();
 
         for (ix, record) in records.iter().enumerate() {
             assert_eq!(
@@ -266,7 +269,7 @@ mod test {
             for record in records.iter() {
                 t.append(record.clone());
             }
-            t.close();
+            t.commit();
         }
 
         {
@@ -294,14 +297,15 @@ mod test {
 
     #[test]
     fn test_bench() {
-        let partitions = 1;
-        let sample = 4 * 1000;
-        let total = sample * 2;
+        let partitions = 4;
+        let sample = 40 * 1000;
+        let total = sample * 15;
 
         let mut handles = vec![];
         let (otx, rx) = channel();
         for part in 0..partitions {
             let tx = otx.clone();
+            let data = vec!["x"; 128].join("");
             let handle = thread::spawn(move || {
                 let mut t = Topic::attach(format!("testing-{}", part), Retention::DEFAULT);
 
@@ -311,7 +315,7 @@ mod test {
                     .into_iter()
                     .map(|message| Record {
                         time: SystemTime::UNIX_EPOCH,
-                        message: ByteArray::from(format!("benchmark-{}", message).as_str()),
+                        message: ByteArray::from(format!("{}-{}", data, message).as_str()),
                     })
                     .collect();
 
@@ -327,7 +331,7 @@ mod test {
                         prev = Some(ix);
                     }
                 }
-                t.close();
+                t.commit();
                 tx.send(total - prev.unwrap_or(0)).unwrap();
             });
             handles.push(handle);
