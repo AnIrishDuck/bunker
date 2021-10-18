@@ -1,4 +1,4 @@
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::{fs, io, path::Path, path::PathBuf, sync::Arc, time::Duration, time::SystemTime};
 
 use parquet::{
@@ -134,40 +134,47 @@ impl SegmentReader {
         for i in 0..metadata.num_row_groups() {
             let row_group_reader = self.reader.get_row_group(i).unwrap();
             let row_group_metadata = metadata.row_group(i);
+            let rows = usize::try_from(row_group_metadata.num_rows()).unwrap();
+            let mut tvs = vec![0; rows];
+            let mut arrs: Vec<ByteArray> = vec![ByteArray::from(vec![0; 1024])]
+                .into_iter()
+                .cycle()
+                .take(rows)
+                .collect();
 
             let mut column_reader = row_group_reader.get_column_reader(0).unwrap();
             let time = match column_reader {
                 // You can also use `get_typed_column_reader` method to extract typed reader.
                 ColumnReader::Int64ColumnReader(ref mut typed_reader) => {
                     res = typed_reader.read_batch(
-                        1, // batch size
+                        rows, // batch size
                         Some(&mut def_levels),
                         Some(&mut rep_levels),
-                        &mut tv,
+                        &mut tvs,
                     );
-                    SystemTime::UNIX_EPOCH + Duration::from_millis(tv[0].try_into().unwrap())
                 }
                 _ => panic!("invalid column type"),
             };
 
             let mut column_reader = row_group_reader.get_column_reader(1).unwrap();
-            let message = match column_reader {
+            match column_reader {
                 // You can also use `get_typed_column_reader` method to extract typed reader.
                 ColumnReader::ByteArrayColumnReader(ref mut typed_reader) => {
                     // TODO: arbitrary message sizes
-                    let mut arr = vec![ByteArray::from(vec![0; 1024])];
                     res = typed_reader.read_batch(
-                        1, // batch size
+                        rows, // batch size
                         Some(&mut def_levels),
                         Some(&mut rep_levels),
-                        &mut arr,
+                        &mut arrs,
                     );
-                    arr[0].clone()
                 }
                 _ => panic!("invalid column type"),
             };
 
-            results.push(Record { time, message });
+            results.extend(tvs.into_iter().zip(arrs.into_iter()).map(|(tv, message)| {
+                let time = SystemTime::UNIX_EPOCH + Duration::from_millis(tv.try_into().unwrap());
+                Record { time, message }
+            }));
         }
 
         results
