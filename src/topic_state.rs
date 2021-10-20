@@ -124,10 +124,13 @@ impl TopicState {
 mod test {
     use super::*;
     use std::time::SystemTime;
+    use tempfile::tempdir;
 
     #[test]
     fn test_update() {
-        let state = TopicState::attach(PathBuf::from("testing.sqlite"));
+        let root = tempdir().unwrap();
+        let path = root.path().join("testing.sqlite");
+        let state = TopicState::attach(PathBuf::from(path));
         assert_eq!(state.get_active_segment(), None);
 
         let time = SystemTime::UNIX_EPOCH..=SystemTime::UNIX_EPOCH;

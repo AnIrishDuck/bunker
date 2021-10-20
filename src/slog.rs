@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 /// A slog (segment log) is a named and ordered series of segments.
 pub(crate) struct Slog {
+    root: PathBuf,
     name: String,
     current: usize,
     pending: Vec<Record>,
@@ -23,9 +24,10 @@ pub struct Index {
 }
 
 impl Slog {
-    pub fn attach(name: String, current: usize) -> Self {
-        let writer = SlogThread::spawn(name.clone(), current);
+    pub fn attach(root: PathBuf, name: String, current: usize) -> Self {
+        let writer = SlogThread::spawn(root.clone(), name.clone(), current);
         Slog {
+            root,
             name,
             current,
             writer,
@@ -35,12 +37,13 @@ impl Slog {
         }
     }
 
-    pub(crate) fn segment_from_name(name: &str, segment_ix: usize) -> Segment {
-        Segment::at(PathBuf::from(format!("{}-{}", name, segment_ix)))
+    pub(crate) fn segment_from_name(root: &PathBuf, name: &str, segment_ix: usize) -> Segment {
+        let file = PathBuf::from(format!("{}-{}", name, segment_ix));
+        Segment::at(root.join(file))
     }
 
     pub(crate) fn get_segment(&self, segment_ix: usize) -> Segment {
-        Slog::segment_from_name(&self.name, segment_ix)
+        Slog::segment_from_name(&self.root, &self.name, segment_ix)
     }
 
     pub(crate) fn get_record(&self, ix: Index) -> Option<Record> {
@@ -148,14 +151,14 @@ impl Drop for SlogThreadControl {
 }
 
 impl SlogThread {
-    fn spawn(name: String, mut current: usize) -> SlogThreadControl {
+    fn spawn(root: PathBuf, name: String, mut current: usize) -> SlogThreadControl {
         let (tx, rx_records) = mpsc::channel();
         let (tx_done, rx) = mpsc::channel();
 
         let write_handle = spawn(move || {
             let mut active = true;
             while active {
-                let mut segment = Slog::segment_from_name(&name, current).create();
+                let mut segment = Slog::segment_from_name(&root, &name, current).create();
                 match rx_records.recv().unwrap() {
                     SlogThreadMessage::Write(rs) => {
                         segment.log(rs);

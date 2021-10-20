@@ -183,11 +183,13 @@ impl SegmentReader {
 
 mod test {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn round_trip() {
-        let p = PathBuf::from("test.parquet");
-        let s = Segment::at(p);
+        let root = tempdir().unwrap();
+        let path = root.path().join("testing.parquet");
+        let s = Segment::at(PathBuf::from(path));
         let records: Vec<_> = vec!["abc", "def", "ghi"]
             .into_iter()
             .map(|message| Record {

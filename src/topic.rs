@@ -33,6 +33,7 @@ impl Retention {
 }
 
 struct Topic {
+    root: PathBuf,
     name: String,
     messages: Slog,
     state: TopicState,
@@ -74,12 +75,17 @@ struct State {
 }
 
 impl Topic {
-    fn attach(name: String, retain: Retention) -> Self {
-        let path = Topic::named_state_path(&name);
+    fn attach(root: PathBuf, name: String, retain: Retention) -> Self {
+        let path = Topic::named_state_path(&root, &name);
         let state = TopicState::attach(PathBuf::from(path));
-        let messages = Slog::attach(name.clone(), state.get_active_segment().unwrap_or(0));
+        let messages = Slog::attach(
+            root.clone(),
+            name.clone(),
+            state.get_active_segment().unwrap_or(0),
+        );
 
         Topic {
+            root,
             name,
             messages,
             last_roll: Instant::now(),
@@ -135,12 +141,12 @@ impl Topic {
         self.open_index() + u128::try_from(index.record).unwrap()
     }
 
-    fn named_state_path(name: &str) -> String {
-        format!("{}-meta.sqlite", name)
+    fn named_state_path(root: &PathBuf, name: &str) -> PathBuf {
+        root.join(format!("{}-meta.sqlite", name))
     }
 
-    fn state_path(&self) -> String {
-        Topic::named_state_path(&self.name)
+    fn state_path(&self) -> PathBuf {
+        Topic::named_state_path(&self.root, &self.name)
     }
 
     fn get_record_by_index(&self, index: u128) -> Option<Record> {
@@ -182,10 +188,13 @@ mod test {
     use parquet::data_type::ByteArray;
     use std::sync::mpsc::channel;
     use std::thread;
+    use tempfile::tempdir;
 
     #[test]
     fn test_append_get() {
-        let mut t = Topic::attach(String::from("testing"), Retention::DEFAULT);
+        let dir = tempdir().unwrap();
+        let root = PathBuf::from(dir.path());
+        let mut t = Topic::attach(root, String::from("testing"), Retention::DEFAULT);
 
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
@@ -213,7 +222,10 @@ mod test {
 
     #[test]
     fn test_rolling_get() {
+        let dir = tempdir().unwrap();
+        let root = PathBuf::from(dir.path());
         let mut t = Topic::attach(
+            root,
             String::from("testing-roll"),
             Retention {
                 max_index: 2,
@@ -249,6 +261,8 @@ mod test {
 
     #[test]
     fn test_durability() {
+        let dir = tempdir().unwrap();
+        let root = PathBuf::from(dir.path());
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
             .map(|message| Record {
@@ -258,6 +272,7 @@ mod test {
             .collect();
         {
             let mut t = Topic::attach(
+                root.clone(),
                 String::from("testing-store"),
                 Retention {
                     max_index: 2,
@@ -274,6 +289,7 @@ mod test {
 
         {
             let t = Topic::attach(
+                root,
                 String::from("testing-store"),
                 Retention {
                     max_index: 2,
@@ -298,6 +314,8 @@ mod test {
     #[ignore]
     #[test]
     fn test_bench() {
+        let dir = tempdir().unwrap();
+        let root = PathBuf::from(dir.path());
         let partitions = 4;
         let sample = 40 * 1000;
         let total = sample * 15;
@@ -307,8 +325,10 @@ mod test {
         for part in 0..partitions {
             let tx = otx.clone();
             let data = vec!["x"; 128].join("");
+            let thread_root = root.clone();
             let handle = thread::spawn(move || {
-                let mut t = Topic::attach(format!("testing-{}", part), Retention::DEFAULT);
+                let mut t =
+                    Topic::attach(thread_root, format!("testing-{}", part), Retention::DEFAULT);
 
                 let seed = 0..sample;
                 let records: Vec<_> = seed
