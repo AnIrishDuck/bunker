@@ -315,7 +315,9 @@ mod test {
                     .into_iter()
                     .map(|message| Record {
                         time: SystemTime::UNIX_EPOCH,
-                        message: ByteArray::from(format!("{}-{}", data, message).as_str()),
+                        message: ByteArray::from(
+                            format!("{{ \"data\": \"{}-{}\" }}", data, message).as_str(),
+                        ),
                     })
                     .collect();
 
