@@ -168,6 +168,15 @@ impl TopicState {
 
         r.map(|v: Result<(String, usize), _>| v.unwrap()).collect()
     }
+
+    pub fn open_index(&self, name: &str) -> u128 {
+        self.get_active_segment(name)
+            .and_then(|segment_ix| {
+                self.get_segment_span(name, segment_ix - 1)
+                    .map(|span| span.index.end)
+            })
+            .unwrap_or(0)
+    }
 }
 
 mod test {

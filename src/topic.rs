@@ -47,6 +47,7 @@ struct Partition {
     topic: String,
     name: String,
     messages: Slog,
+    open_index: u128,
     last_roll: Instant,
     retain: Retention,
     state: PartitionState,
@@ -167,10 +168,12 @@ impl Partition {
         let state = PartitionState::attach(PathBuf::from(path));
         let segment = state.get_active_segment(&name).unwrap_or(0);
         let messages = Slog::attach(root.clone(), Partition::slog_name(&topic, &name), segment);
+        let open_index = state.open_index(&name);
         Partition {
             root,
             topic,
             state,
+            open_index,
             name,
             messages,
             last_roll: Instant::now(),
@@ -187,14 +190,14 @@ impl Partition {
     }
 
     fn append(&mut self, r: Record) -> u128 {
-        let start = self.open_index();
+        let start = self.open_index;
         let index = self.messages.append(r);
         self.roll_when_needed(start);
         start + u128::try_from(index.record).unwrap()
     }
 
     fn get_record_by_index(&self, index: u128) -> Option<Record> {
-        let open = self.open_index();
+        let open = self.open_index;
         let slog_index = if index >= open {
             Some(Index {
                 record: usize::try_from(index - open).unwrap(),
@@ -224,6 +227,7 @@ impl Partition {
         self.state
             .update(&self.name, self.messages.current_segment_ix(), &span);
         self.last_roll = Instant::now();
+        self.open_index = span.index.end;
         self.messages.roll();
     }
 
@@ -245,23 +249,12 @@ impl Partition {
         }
     }
 
-    fn open_index(&self) -> u128 {
-        self.state
-            .get_active_segment(&self.name)
-            .and_then(|segment_ix| {
-                self.state
-                    .get_segment_span(&self.name, segment_ix - 1)
-                    .map(|span| span.index.end)
-            })
-            .unwrap_or(0)
-    }
-
     fn commit(&mut self) {
         // await completion of any pending write
         self.messages.commit();
         if let Some(time) = self.messages.current_time_range() {
             // flush remaining messages
-            let start = self.open_index();
+            let start = self.state.open_index(&self.name);
             self.roll(start, time);
             self.messages.commit();
         }
