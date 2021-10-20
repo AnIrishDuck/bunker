@@ -53,34 +53,6 @@ struct Partition {
     state: PartitionState,
 }
 
-struct Indices {
-    by_start_time: BTreeMap<SystemTime, Vec<usize>>,
-    by_end_time: BTreeMap<SystemTime, Vec<usize>>,
-    by_start_ix: BTreeMap<u128, usize>,
-}
-
-impl Indices {
-    fn new() -> Self {
-        Indices {
-            by_start_time: BTreeMap::new(),
-            by_end_time: BTreeMap::new(),
-            by_start_ix: BTreeMap::new(),
-        }
-    }
-
-    fn update(&mut self, segment_ix: usize, ixs: &SegmentSpan<Range<u128>>) {
-        let t = *ixs.time.start();
-        let v = self.by_start_time.entry(t).or_insert(vec![]);
-        v.push(segment_ix);
-
-        let t = *ixs.time.end();
-        let v = self.by_end_time.entry(t).or_insert(vec![]);
-        v.push(segment_ix);
-
-        self.by_start_ix.insert(ixs.index.start, segment_ix);
-    }
-}
-
 #[derive(Default, Serialize, Deserialize)]
 struct TopicState {
     partitions: Vec<String>,
