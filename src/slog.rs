@@ -59,7 +59,7 @@ impl Slog {
         }
     }
 
-    pub(crate) fn append(&mut self, r: Record) -> Index {
+    pub(crate) fn append(&mut self, r: &Record) -> Index {
         let record = self.pending.len();
         self.pending_size += r.message.len();
         self.pending.push(r.clone());

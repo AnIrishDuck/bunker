@@ -92,10 +92,10 @@ impl Topic {
         root.join(format!("{}.json", name))
     }
 
-    fn append(&self, partition_name: &String, r: Record) -> u128 {
+    fn append(&self, partition_name: &String, rs: &[Record]) -> Option<u128> {
         let partitions = self.partitions.read().expect("partition map read");
         if let Some(part) = partitions.get(partition_name) {
-            part.write().expect("partition write").append(r)
+            part.write().expect("partition write").append(rs)
         } else {
             drop(partitions);
             let mut partitions = self.partitions.write().expect("partition map write");
@@ -105,7 +105,7 @@ impl Topic {
                 partition_name.clone(),
                 self.retain.clone(),
             );
-            let ix = part.append(r);
+            let ix = part.append(rs);
             partitions.insert(partition_name.clone(), RwLock::new(part));
 
             {
@@ -169,11 +169,14 @@ impl Partition {
         format!("{}-{}", topic, name)
     }
 
-    fn append(&mut self, r: Record) -> u128 {
+    fn append(&mut self, rs: &[Record]) -> Option<u128> {
         let start = self.open_index;
-        let index = self.messages.append(r);
-        self.roll_when_needed(start);
-        start + u128::try_from(index.record).unwrap()
+        let mut index = None;
+        for r in rs {
+            let index = Some(self.messages.append(r));
+            self.roll_when_needed(start);
+        }
+        index.map(|i: Index| start + u128::try_from(i.record).unwrap())
     }
 
     fn get_record_by_index(&self, index: u128) -> Option<Record> {
@@ -264,7 +267,7 @@ mod test {
             .collect();
 
         for record in records.iter() {
-            t.append(&p, record.clone());
+            t.append(&p, &vec![record.clone()]);
         }
 
         for (ix, record) in records.iter().enumerate() {
@@ -303,7 +306,7 @@ mod test {
             .collect();
 
         for record in records.iter() {
-            t.append(&p, record.clone());
+            t.append(&p, &vec![record.clone()]);
         }
         t.commit();
 
@@ -343,7 +346,7 @@ mod test {
             );
 
             for record in records.iter() {
-                t.append(&p, record.clone());
+                t.append(&p, &vec![record.clone()]);
             }
             t.commit();
         }
@@ -403,17 +406,27 @@ mod test {
                     })
                     .collect();
 
+                let mut ix = 0;
                 let mut prev = None;
-                for (ix, record) in records.iter().cycle().take(total).enumerate() {
-                    let mut r = record.clone();
-                    r.time = SystemTime::now();
-                    t.append(&p, r);
-                    if ix % 1000 == 0 {
-                        if let Some(prev_ix) = prev {
-                            tx.send(ix - prev_ix).unwrap();
-                        }
-                        prev = Some(ix);
+                use itermore::IterMore;
+                for rs in records.iter().cycle().take(total).chunks::<1000>() {
+                    let now = SystemTime::now();
+                    let rs: Vec<Record> = rs
+                        .iter()
+                        .cloned()
+                        .map(|r| {
+                            let mut c = r.clone();
+                            c.time = now;
+                            c
+                        })
+                        .collect();
+
+                    t.append(&p, &rs);
+                    if let Some(prev_ix) = prev {
+                        tx.send(ix - prev_ix).unwrap();
                     }
+                    prev = Some(ix);
+                    ix += rs.len();
                 }
                 t.commit();
                 tx.send(total - prev.unwrap_or(0)).unwrap();

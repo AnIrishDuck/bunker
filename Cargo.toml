@@ -15,4 +15,5 @@ tokio = { version = "1", features = ["full"] }
 warp = "0.3"
 
 [dev-dependencies]
+itermore = "0.1"
 tempfile = "3.2"
