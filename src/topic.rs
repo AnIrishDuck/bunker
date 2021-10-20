@@ -2,11 +2,10 @@ use crate::segment::Record;
 use crate::slog::{Index, Slog};
 use crate::topic_state::TopicState as PartitionState;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
+use std::ops::{RangeBounds, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -43,8 +42,6 @@ struct Topic {
 }
 
 struct Partition {
-    root: PathBuf,
-    topic: String,
     name: String,
     messages: Slog,
     open_index: u128,
@@ -128,7 +125,7 @@ impl Topic {
     }
 
     fn commit(&mut self) {
-        for (key, part) in self.partitions.iter_mut() {
+        for (_, part) in self.partitions.iter_mut() {
             part.commit();
         }
     }
@@ -142,8 +139,6 @@ impl Partition {
         let messages = Slog::attach(root.clone(), Partition::slog_name(&topic, &name), segment);
         let open_index = state.open_index(&name);
         Partition {
-            root,
-            topic,
             state,
             open_index,
             name,
