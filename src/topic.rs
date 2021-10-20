@@ -295,6 +295,7 @@ mod test {
         }
     }
 
+    #[ignore]
     #[test]
     fn test_bench() {
         let partitions = 4;
