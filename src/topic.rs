@@ -1,8 +1,9 @@
 use crate::segment::Record;
 use crate::slog::{Index, Slog};
-use crate::topic_state::TopicState;
+use crate::topic_state::TopicState as PartitionState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
 use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
@@ -18,6 +19,7 @@ where
     pub index: R,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Retention {
     max_size: usize,
     max_index: usize,
@@ -35,10 +37,19 @@ impl Retention {
 struct Topic {
     root: PathBuf,
     name: String,
-    messages: Slog,
     state: TopicState,
+    partitions: HashMap<String, Partition>,
+    retain: Retention,
+}
+
+struct Partition {
+    root: PathBuf,
+    topic: String,
+    name: String,
+    messages: Slog,
     last_roll: Instant,
     retain: Retention,
+    state: PartitionState,
 }
 
 struct Indices {
@@ -69,84 +80,117 @@ impl Indices {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct State {
-    spans: Vec<SegmentSpan<Range<u128>>>,
+#[derive(Default, Serialize, Deserialize)]
+struct TopicState {
+    partitions: Vec<String>,
 }
 
 impl Topic {
     fn attach(root: PathBuf, name: String, retain: Retention) -> Self {
-        let path = Topic::named_state_path(&root, &name);
-        let state = TopicState::attach(PathBuf::from(path));
-        let messages = Slog::attach(
-            root.clone(),
-            name.clone(),
-            state.get_active_segment().unwrap_or(0),
-        );
+        let path = Topic::state_path(&root, &name);
+        let state = if Path::exists(&path) {
+            serde_json::from_reader(fs::File::open(path).unwrap()).unwrap()
+        } else {
+            TopicState::default()
+        };
+
+        let partitions = state
+            .partitions
+            .iter()
+            .map(|partition| {
+                let slog = Partition::attach(
+                    root.clone(),
+                    name.clone(),
+                    partition.clone(),
+                    retain.clone(),
+                );
+                (partition.clone(), slog)
+            })
+            .collect();
 
         Topic {
             root,
             name,
+            state,
+            partitions,
+            retain,
+        }
+    }
+
+    fn state_path(root: &PathBuf, name: &str) -> PathBuf {
+        root.join(format!("{}.json", name))
+    }
+
+    fn append(&mut self, partition_name: &String, r: Record) -> u128 {
+        if let Some(part) = self.partitions.get_mut(partition_name) {
+            part.append(r)
+        } else {
+            let mut part = Partition::attach(
+                self.root.clone(),
+                self.name.clone(),
+                partition_name.clone(),
+                self.retain.clone(),
+            );
+            let ix = part.append(r);
+            self.partitions.insert(partition_name.clone(), part);
+
+            self.state.partitions.push(partition_name.clone());
+            let path = Topic::state_path(&self.root, &self.name);
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            serde_json::to_writer(&file, &self.state).unwrap();
+            file.sync_data().unwrap();
+            ix
+        }
+    }
+
+    fn get_record_by_index(&self, partition_name: &String, index: u128) -> Option<Record> {
+        self.partitions
+            .get(partition_name)
+            .and_then(|part| part.get_record_by_index(index))
+    }
+
+    fn commit(&mut self) {
+        for (key, part) in self.partitions.iter_mut() {
+            part.commit();
+        }
+    }
+}
+
+impl Partition {
+    fn attach(root: PathBuf, topic: String, name: String, retain: Retention) -> Partition {
+        let path = Partition::state_path(&root, &name);
+        let state = PartitionState::attach(PathBuf::from(path));
+        let segment = state.get_active_segment(&name).unwrap_or(0);
+        let messages = Slog::attach(root.clone(), Partition::slog_name(&topic, &name), segment);
+        Partition {
+            root,
+            topic,
+            state,
+            name,
             messages,
             last_roll: Instant::now(),
             retain,
-            state,
         }
     }
 
-    fn roll(&mut self, time: RangeInclusive<SystemTime>) {
-        let start = self.open_index();
-        let size = u128::try_from(self.messages.current_len()).unwrap();
-        let span = SegmentSpan {
-            time,
-            index: start..start + size,
-        };
-        self.state.update(self.messages.current_segment_ix(), &span);
-        self.last_roll = Instant::now();
-        self.messages.roll();
-    }
-
-    fn roll_when_needed(&mut self) {
-        if let Some(time) = self.messages.current_time_range() {
-            if let Some(d) = self.retain.max_duration {
-                if Instant::now() - self.last_roll > d {
-                    return self.roll(time);
-                }
-            }
-
-            if self.messages.current_len() > self.retain.max_index {
-                return self.roll(time);
-            }
-
-            if self.messages.current_size() > self.retain.max_size {
-                return self.roll(time);
-            }
-        }
-    }
-
-    fn open_index(&self) -> u128 {
-        self.state
-            .get_active_segment()
-            .and_then(|segment_ix| {
-                self.state
-                    .get_segment_span(segment_ix - 1)
-                    .map(|span| span.index.end)
-            })
-            .unwrap_or(0)
-    }
-
-    fn append(&mut self, r: Record) -> u128 {
-        self.roll_when_needed();
-        let index = self.messages.append(r);
-        self.open_index() + u128::try_from(index.record).unwrap()
-    }
-
-    fn named_state_path(root: &PathBuf, name: &str) -> PathBuf {
+    fn state_path(root: &PathBuf, name: &str) -> PathBuf {
         root.join(format!("{}-meta.sqlite", name))
     }
 
-    fn state_path(&self) -> PathBuf {
-        Topic::named_state_path(&self.root, &self.name)
+    fn slog_name(topic: &str, name: &str) -> String {
+        format!("{}-{}", topic, name)
+    }
+
+    fn append(&mut self, r: Record) -> u128 {
+        let start = self.open_index();
+        let index = self.messages.append(r);
+        self.roll_when_needed(start);
+        start + u128::try_from(index.record).unwrap()
     }
 
     fn get_record_by_index(&self, index: u128) -> Option<Record> {
@@ -154,13 +198,13 @@ impl Topic {
         let slog_index = if index >= open {
             Some(Index {
                 record: usize::try_from(index - open).unwrap(),
-                segment: self.state.get_active_segment().unwrap_or(0),
+                segment: self.state.get_active_segment(&self.name).unwrap_or(0),
             })
         } else {
             self.state
-                .get_segment_for_ix(u64::try_from(index).unwrap())
+                .get_segment_for_ix(&self.name, u64::try_from(index).unwrap())
                 .map(|segment| {
-                    let span = self.state.get_segment_span(segment).unwrap();
+                    let span = self.state.get_segment_span(&self.name, segment).unwrap();
                     Index {
                         record: usize::try_from(index - span.index.start).unwrap(),
                         segment,
@@ -171,13 +215,54 @@ impl Topic {
         slog_index.and_then(|ix| self.messages.get_record(ix))
     }
 
+    fn roll(&mut self, start: u128, time: RangeInclusive<SystemTime>) {
+        let size = u128::try_from(self.messages.current_len()).unwrap();
+        let span = SegmentSpan {
+            time,
+            index: start..start + size,
+        };
+        self.state
+            .update(&self.name, self.messages.current_segment_ix(), &span);
+        self.last_roll = Instant::now();
+        self.messages.roll();
+    }
+
+    fn roll_when_needed(&mut self, start: u128) {
+        if let Some(time) = self.messages.current_time_range() {
+            if let Some(d) = self.retain.max_duration {
+                if Instant::now() - self.last_roll > d {
+                    return self.roll(start, time);
+                }
+            }
+
+            if self.messages.current_len() > self.retain.max_index {
+                return self.roll(start, time);
+            }
+
+            if self.messages.current_size() > self.retain.max_size {
+                return self.roll(start, time);
+            }
+        }
+    }
+
+    fn open_index(&self) -> u128 {
+        self.state
+            .get_active_segment(&self.name)
+            .and_then(|segment_ix| {
+                self.state
+                    .get_segment_span(&self.name, segment_ix - 1)
+                    .map(|span| span.index.end)
+            })
+            .unwrap_or(0)
+    }
+
     fn commit(&mut self) {
-        let range = self.messages.current_time_range();
-        if let Some(time) = range {
-            // TODO order of operations is wonky here, first commit clears any pending roll,
-            // then roll is forced, then next commit waits for that roll to complete.
-            self.messages.commit();
-            self.roll(time);
+        // await completion of any pending write
+        self.messages.commit();
+        if let Some(time) = self.messages.current_time_range() {
+            // flush remaining messages
+            let start = self.open_index();
+            self.roll(start, time);
             self.messages.commit();
         }
     }
@@ -195,6 +280,7 @@ mod test {
         let dir = tempdir().unwrap();
         let root = PathBuf::from(dir.path());
         let mut t = Topic::attach(root, String::from("testing"), Retention::DEFAULT);
+        let p = String::from("default");
 
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
@@ -205,17 +291,17 @@ mod test {
             .collect();
 
         for record in records.iter() {
-            t.append(record.clone());
+            t.append(&p, record.clone());
         }
 
         for (ix, record) in records.iter().enumerate() {
             assert_eq!(
-                t.get_record_by_index(u128::try_from(ix).unwrap()),
+                t.get_record_by_index(&p, u128::try_from(ix).unwrap()),
                 Some(record.clone())
             );
         }
         assert_eq!(
-            t.get_record_by_index(u128::try_from(records.len()).unwrap()),
+            t.get_record_by_index(&p, u128::try_from(records.len()).unwrap()),
             None
         );
     }
@@ -233,6 +319,7 @@ mod test {
                 max_duration: None,
             },
         );
+        let p = String::from("default");
 
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
@@ -243,18 +330,18 @@ mod test {
             .collect();
 
         for record in records.iter() {
-            t.append(record.clone());
+            t.append(&p, record.clone());
         }
         t.commit();
 
         for (ix, record) in records.iter().enumerate() {
             assert_eq!(
-                t.get_record_by_index(u128::try_from(ix).unwrap()),
+                t.get_record_by_index(&p, u128::try_from(ix).unwrap()),
                 Some(record.clone())
             );
         }
         assert_eq!(
-            t.get_record_by_index(u128::try_from(records.len()).unwrap()),
+            t.get_record_by_index(&p, u128::try_from(records.len()).unwrap()),
             None
         );
     }
@@ -263,6 +350,7 @@ mod test {
     fn test_durability() {
         let dir = tempdir().unwrap();
         let root = PathBuf::from(dir.path());
+        let p = String::from("default");
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
             .map(|message| Record {
@@ -282,7 +370,7 @@ mod test {
             );
 
             for record in records.iter() {
-                t.append(record.clone());
+                t.append(&p, record.clone());
             }
             t.commit();
         }
@@ -300,12 +388,12 @@ mod test {
 
             for (ix, record) in records.iter().enumerate() {
                 assert_eq!(
-                    t.get_record_by_index(u128::try_from(ix).unwrap()),
+                    t.get_record_by_index(&p, u128::try_from(ix).unwrap()),
                     Some(record.clone())
                 );
             }
             assert_eq!(
-                t.get_record_by_index(u128::try_from(records.len()).unwrap()),
+                t.get_record_by_index(&p, u128::try_from(records.len()).unwrap()),
                 None
             );
         }
@@ -326,9 +414,9 @@ mod test {
             let tx = otx.clone();
             let data = vec!["x"; 128].join("");
             let thread_root = root.clone();
+            let p = format!("part-{}", part);
             let handle = thread::spawn(move || {
-                let mut t =
-                    Topic::attach(thread_root, format!("testing-{}", part), Retention::DEFAULT);
+                let mut t = Topic::attach(thread_root, String::from("testing"), Retention::DEFAULT);
 
                 let seed = 0..sample;
                 let records: Vec<_> = seed
@@ -346,7 +434,7 @@ mod test {
                 for (ix, record) in records.iter().cycle().take(total).enumerate() {
                     let mut r = record.clone();
                     r.time = SystemTime::now();
-                    t.append(r);
+                    t.append(&p, r);
                     if ix % 1000 == 0 {
                         if let Some(prev_ix) = prev {
                             tx.send(ix - prev_ix).unwrap();
@@ -363,7 +451,7 @@ mod test {
         let start = Instant::now();
         let mut written = 0;
         while written < total * partitions {
-            written += rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            written += rx.recv_timeout(Duration::from_secs(60)).unwrap();
             println!(
                 "{}/{} elapsed: {}ms",
                 written,

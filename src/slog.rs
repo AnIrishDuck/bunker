@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread::{spawn, JoinHandle};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// A slog (segment log) is a named and ordered series of segments.
 pub(crate) struct Slog {
@@ -126,7 +126,7 @@ struct SlogThreadControl {
 impl SlogThreadControl {
     fn try_send(&mut self, rs: Vec<Record>) -> bool {
         if !self.ready {
-            match self.rx.try_recv() {
+            match self.rx.recv_timeout(Duration::from_millis(1000)) {
                 Ok(()) => self.ready = true,
                 Err(_) => return false,
             }
