@@ -7,6 +7,7 @@ use std::convert::TryFrom;
 use std::fs;
 use std::ops::{RangeBounds, RangeInclusive};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,8 +37,8 @@ impl Retention {
 struct Topic {
     root: PathBuf,
     name: String,
-    state: TopicState,
-    partitions: HashMap<String, Partition>,
+    state: RwLock<TopicState>,
+    partitions: RwLock<HashMap<String, RwLock<Partition>>>,
     retain: Retention,
 }
 
@@ -50,7 +51,7 @@ struct Partition {
     state: PartitionState,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct TopicState {
     partitions: Vec<String>,
 }
@@ -74,15 +75,15 @@ impl Topic {
                     partition.clone(),
                     retain.clone(),
                 );
-                (partition.clone(), slog)
+                (partition.clone(), RwLock::new(slog))
             })
             .collect();
 
         Topic {
             root,
             name,
-            state,
-            partitions,
+            state: RwLock::new(state),
+            partitions: RwLock::new(partitions),
             retain,
         }
     }
@@ -91,10 +92,13 @@ impl Topic {
         root.join(format!("{}.json", name))
     }
 
-    fn append(&mut self, partition_name: &String, r: Record) -> u128 {
-        if let Some(part) = self.partitions.get_mut(partition_name) {
-            part.append(r)
+    fn append(&self, partition_name: &String, r: Record) -> u128 {
+        let partitions = self.partitions.read().expect("partition map read");
+        if let Some(part) = partitions.get(partition_name) {
+            part.write().expect("partition write").append(r)
         } else {
+            drop(partitions);
+            let mut partitions = self.partitions.write().expect("partition map write");
             let mut part = Partition::attach(
                 self.root.clone(),
                 self.name.clone(),
@@ -102,31 +106,40 @@ impl Topic {
                 self.retain.clone(),
             );
             let ix = part.append(r);
-            self.partitions.insert(partition_name.clone(), part);
+            partitions.insert(partition_name.clone(), RwLock::new(part));
 
-            self.state.partitions.push(partition_name.clone());
-            let path = Topic::state_path(&self.root, &self.name);
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
-            serde_json::to_writer(&file, &self.state).unwrap();
-            file.sync_data().unwrap();
+            {
+                let mut state = self.state.write().expect("state write");
+                state.partitions.push(partition_name.clone());
+                let path = Topic::state_path(&self.root, &self.name);
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap();
+                serde_json::to_writer(&file, &state.clone()).unwrap();
+                file.sync_data().unwrap();
+            }
             ix
         }
     }
 
     fn get_record_by_index(&self, partition_name: &String, index: u128) -> Option<Record> {
         self.partitions
+            .read()
+            .expect("partition map read")
             .get(partition_name)
-            .and_then(|part| part.get_record_by_index(index))
+            .and_then(|part| {
+                part.read()
+                    .expect("partition read")
+                    .get_record_by_index(index)
+            })
     }
 
-    fn commit(&mut self) {
-        for (_, part) in self.partitions.iter_mut() {
-            part.commit();
+    fn commit(&self) {
+        for (_, part) in self.partitions.read().expect("partition map read").iter() {
+            part.write().expect("partition write").commit();
         }
     }
 }
