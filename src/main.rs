@@ -12,7 +12,7 @@ mod slog;
 mod topic;
 mod topic_state;
 
-use topic::{Record, Retention, Topic};
+use topic::{Config, Record, Topic};
 
 #[derive(Deserialize)]
 struct Insert {
@@ -55,7 +55,7 @@ async fn main() {
             } else {
                 drop(read);
                 let mut write = topics.write().expect("topic map write");
-                let topic = Topic::attach((*root).clone(), topic_name.clone(), Retention::DEFAULT);
+                let topic = Topic::attach((*root).clone(), topic_name.clone(), Config::default());
                 let index = topic.append(&partition, &rs);
                 write.insert(topic_name, topic);
                 index

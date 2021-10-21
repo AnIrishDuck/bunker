@@ -21,18 +21,43 @@ where
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Retention {
-    pub max_size: usize,
-    pub max_index: usize,
-    pub max_duration: Option<Duration>,
+pub struct Rolling {
+    pub max_segment_size: usize,
+    pub max_segment_index: usize,
+    pub max_segment_duration: Option<Duration>,
 }
 
-impl Retention {
-    pub const DEFAULT: Retention = Retention {
-        max_size: 100 * 1024 * 1024,
-        max_index: 100000,
-        max_duration: None,
-    };
+impl Default for Rolling {
+    fn default() -> Self {
+        Rolling {
+            max_segment_size: 100 * 1024 * 1024,
+            max_segment_index: 100000,
+            max_segment_duration: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Retention {
+    pub max_segment_count: Option<usize>,
+    pub max_bytes: usize,
+    pub max_segment_age: Option<Duration>,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention {
+            max_segment_count: Some(10000),
+            max_bytes: 1 * 1024 * 1024 * 1024,
+            max_segment_age: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Config {
+    retain: Retention,
+    roll: Rolling,
 }
 
 pub struct Topic {
@@ -40,7 +65,7 @@ pub struct Topic {
     name: String,
     state: RwLock<TopicState>,
     partitions: RwLock<HashMap<String, RwLock<Partition>>>,
-    retain: Retention,
+    config: Config,
 }
 
 struct Partition {
@@ -49,7 +74,7 @@ struct Partition {
     messages: Slog,
     open_index: u128,
     last_roll: Instant,
-    retain: Retention,
+    config: Config,
     state: Mutex<PartitionState>,
 }
 
@@ -59,7 +84,7 @@ struct TopicState {
 }
 
 impl Topic {
-    pub fn attach(root: PathBuf, name: String, retain: Retention) -> Self {
+    pub fn attach(root: PathBuf, name: String, config: Config) -> Self {
         if !Path::exists(&root) {
             fs::create_dir(&root).unwrap();
         }
@@ -78,7 +103,7 @@ impl Topic {
                     Topic::partition_root(&root, &name),
                     &name,
                     partition,
-                    retain.clone(),
+                    config.clone(),
                 );
                 (partition.clone(), RwLock::new(slog))
             })
@@ -89,7 +114,7 @@ impl Topic {
             name,
             state: RwLock::new(state),
             partitions: RwLock::new(partitions),
-            retain,
+            config,
         }
     }
 
@@ -112,7 +137,7 @@ impl Topic {
                 Topic::partition_root(&self.root, &self.name),
                 &self.name,
                 partition_name,
-                self.retain.clone(),
+                self.config.clone(),
             );
             let ix = part.append(rs);
             partitions.insert(partition_name.to_string(), RwLock::new(part));
@@ -154,7 +179,7 @@ impl Topic {
 }
 
 impl Partition {
-    fn attach(root: PathBuf, topic: &str, name: &str, retain: Retention) -> Partition {
+    fn attach(root: PathBuf, topic: &str, name: &str, config: Config) -> Partition {
         if !Path::exists(&root) {
             fs::create_dir(&root).unwrap();
         }
@@ -170,7 +195,7 @@ impl Partition {
             name: String::from(name),
             messages,
             last_roll: Instant::now(),
-            retain,
+            config,
         }
     }
 
@@ -234,17 +259,18 @@ impl Partition {
 
     fn roll_when_needed(&mut self, start: u128) {
         if let Some(time) = self.messages.current_time_range() {
-            if let Some(d) = self.retain.max_duration {
+            let roll = &self.config.roll;
+            if let Some(d) = roll.max_segment_duration {
                 if Instant::now() - self.last_roll > d {
                     return self.roll(start, time);
                 }
             }
 
-            if self.messages.current_len() > self.retain.max_index {
+            if self.messages.current_len() > roll.max_segment_index {
                 return self.roll(start, time);
             }
 
-            if self.messages.current_size() > self.retain.max_size {
+            if self.messages.current_size() > roll.max_segment_size {
                 return self.roll(start, time);
             }
         }
@@ -274,7 +300,7 @@ mod test {
     fn test_append_get() {
         let dir = tempdir().unwrap();
         let root = PathBuf::from(dir.path());
-        let mut t = Topic::attach(root, String::from("testing"), Retention::DEFAULT);
+        let mut t = Topic::attach(root, String::from("testing"), Config::default());
         let p = "default";
 
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
@@ -308,10 +334,12 @@ mod test {
         let mut t = Topic::attach(
             root,
             String::from("testing-roll"),
-            Retention {
-                max_index: 2,
-                max_size: 100000,
-                max_duration: None,
+            Config {
+                roll: Rolling {
+                    max_segment_index: 2,
+                    ..Rolling::default()
+                },
+                ..Config::default()
             },
         );
         let p = "default";
@@ -357,10 +385,12 @@ mod test {
             let mut t = Topic::attach(
                 root.clone(),
                 String::from("testing-store"),
-                Retention {
-                    max_index: 2,
-                    max_size: 100000,
-                    max_duration: None,
+                Config {
+                    roll: Rolling {
+                        max_segment_index: 2,
+                        ..Rolling::default()
+                    },
+                    ..Config::default()
                 },
             );
 
@@ -374,10 +404,12 @@ mod test {
             let t = Topic::attach(
                 root,
                 String::from("testing-store"),
-                Retention {
-                    max_index: 2,
-                    max_size: 100000,
-                    max_duration: None,
+                Config {
+                    roll: Rolling {
+                        max_segment_index: 2,
+                        ..Rolling::default()
+                    },
+                    ..Config::default()
                 },
             );
 
@@ -411,7 +443,7 @@ mod test {
             let thread_root = root.clone();
             let p = format!("part-{}", part);
             let handle = thread::spawn(move || {
-                let mut t = Topic::attach(thread_root, String::from("testing"), Retention::DEFAULT);
+                let mut t = Topic::attach(thread_root, String::from("testing"), Config::default());
 
                 let seed = 0..sample;
                 let records: Vec<_> = seed
