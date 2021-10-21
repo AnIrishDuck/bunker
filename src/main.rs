@@ -22,7 +22,7 @@ struct Insert {
 
 #[derive(Serialize)]
 struct Inserted {
-    partition_name: String,
+    partition: Option<String>,
     final_index: Option<u128>,
     time: SystemTime,
 }
@@ -47,21 +47,22 @@ async fn main() {
                     message: ByteArray::from(m.as_str()),
                 })
                 .collect();
-            let partition_name = request.partition.unwrap_or(String::from(""));
+            let default = String::from("");
+            let partition = request.partition.unwrap_or(default);
             let read = topics.read().expect("topic map read");
             let final_index = if let Some(topic) = read.get(&topic_name) {
-                topic.append(&partition_name, &rs)
+                topic.append(&partition, &rs)
             } else {
                 drop(read);
                 let mut write = topics.write().expect("topic map write");
                 let topic = Topic::attach((*root).clone(), topic_name.clone(), Retention::DEFAULT);
-                let index = topic.append(&partition_name, &rs);
+                let index = topic.append(&partition, &rs);
                 write.insert(topic_name, topic);
                 index
             };
 
             let result = Inserted {
-                partition_name,
+                partition: Some(partition),
                 final_index,
                 time,
             };

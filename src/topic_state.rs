@@ -189,28 +189,28 @@ mod test {
         let root = tempdir().unwrap();
         let path = root.path().join("testing.sqlite");
         let state = TopicState::attach(PathBuf::from(path));
-        assert_eq!(state.get_active_segment("default"), None);
+        assert_eq!(state.get_active_segment(""), None);
 
         let time = SystemTime::UNIX_EPOCH..=SystemTime::UNIX_EPOCH;
         for ix in 0..10 {
             let time = time.clone();
-            state.update("default", 0, &SegmentSpan { time, index: 0..ix })
+            state.update("", 0, &SegmentSpan { time, index: 0..ix })
         }
 
         state.update(
-            "default",
+            "",
             1,
             &SegmentSpan {
                 time,
                 index: 10..20,
             },
         );
-        assert_eq!(state.get_segment_for_ix("default", 0), Some(0));
-        assert_eq!(state.get_segment_for_ix("default", 5), Some(0));
-        assert_eq!(state.get_segment_for_ix("default", 9), Some(0));
-        assert_eq!(state.get_segment_for_ix("default", 15), Some(1));
-        assert_eq!(state.get_segment_for_ix("default", 200), Some(1));
-        assert_eq!(state.get_active_segment("default"), Some(2));
+        assert_eq!(state.get_segment_for_ix("", 0), Some(0));
+        assert_eq!(state.get_segment_for_ix("", 5), Some(0));
+        assert_eq!(state.get_segment_for_ix("", 9), Some(0));
+        assert_eq!(state.get_segment_for_ix("", 15), Some(1));
+        assert_eq!(state.get_segment_for_ix("", 200), Some(1));
+        assert_eq!(state.get_active_segment(""), Some(2));
     }
 
     #[test]
@@ -219,15 +219,17 @@ mod test {
         let path = root.path().join("testing.sqlite");
         let state = TopicState::attach(PathBuf::from(path));
         assert_eq!(state.get_active_segments(), HashMap::new());
+        let a = "a";
+        let b = "b";
 
         let time = SystemTime::UNIX_EPOCH..=SystemTime::UNIX_EPOCH;
         for ix in 0..10 {
             let time = time.clone();
-            state.update("a", 0, &SegmentSpan { time, index: 0..ix })
+            state.update(a, 0, &SegmentSpan { time, index: 0..ix })
         }
 
         state.update(
-            "a",
+            a,
             1,
             &SegmentSpan {
                 time: time.clone(),
@@ -236,11 +238,11 @@ mod test {
         );
         assert_eq!(
             state.get_active_segments(),
-            vec![("a".to_string(), 2)].into_iter().collect()
+            vec![(a.to_string(), 2)].into_iter().collect()
         );
 
         state.update(
-            "b",
+            b,
             0,
             &SegmentSpan {
                 time,
@@ -250,7 +252,7 @@ mod test {
 
         assert_eq!(
             state.get_active_segments(),
-            vec![("a".to_string(), 2), ("b".to_string(), 1)]
+            vec![(a.to_string(), 2), (b.to_string(), 1)]
                 .into_iter()
                 .collect()
         );

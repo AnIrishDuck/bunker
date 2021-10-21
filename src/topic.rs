@@ -44,6 +44,7 @@ pub struct Topic {
 }
 
 struct Partition {
+    topic: String,
     name: String,
     messages: Slog,
     open_index: u128,
@@ -59,6 +60,9 @@ struct TopicState {
 
 impl Topic {
     pub fn attach(root: PathBuf, name: String, retain: Retention) -> Self {
+        if !Path::exists(&root) {
+            fs::create_dir(&root).unwrap();
+        }
         let path = Topic::state_path(&root, &name);
         let state = if Path::exists(&path) {
             serde_json::from_reader(fs::File::open(path).unwrap()).unwrap()
@@ -71,9 +75,9 @@ impl Topic {
             .iter()
             .map(|partition| {
                 let slog = Partition::attach(
-                    root.clone(),
-                    name.clone(),
-                    partition.clone(),
+                    Topic::partition_root(&root, &name),
+                    &name,
+                    partition,
                     retain.clone(),
                 );
                 (partition.clone(), RwLock::new(slog))
@@ -89,11 +93,15 @@ impl Topic {
         }
     }
 
+    fn partition_root(root: &PathBuf, name: &str) -> PathBuf {
+        root.join(name)
+    }
+
     fn state_path(root: &PathBuf, name: &str) -> PathBuf {
         root.join(format!("{}.json", name))
     }
 
-    pub fn append(&self, partition_name: &String, rs: &[Record]) -> Option<u128> {
+    pub fn append(&self, partition_name: &str, rs: &[Record]) -> Option<u128> {
         let partitions = self.partitions.read().expect("partition map read");
         if let Some(part) = partitions.get(partition_name) {
             part.write().expect("partition write").append(rs)
@@ -101,17 +109,17 @@ impl Topic {
             drop(partitions);
             let mut partitions = self.partitions.write().expect("partition map write");
             let mut part = Partition::attach(
-                self.root.clone(),
-                self.name.clone(),
-                partition_name.clone(),
+                Topic::partition_root(&self.root, &self.name),
+                &self.name,
+                partition_name,
                 self.retain.clone(),
             );
             let ix = part.append(rs);
-            partitions.insert(partition_name.clone(), RwLock::new(part));
+            partitions.insert(partition_name.to_string(), RwLock::new(part));
 
             {
                 let mut state = self.state.write().expect("state write");
-                state.partitions.push(partition_name.clone());
+                state.partitions.push(partition_name.to_string());
                 let path = Topic::state_path(&self.root, &self.name);
                 let file = fs::OpenOptions::new()
                     .write(true)
@@ -126,7 +134,7 @@ impl Topic {
         }
     }
 
-    pub fn get_record_by_index(&self, partition_name: &String, index: u128) -> Option<Record> {
+    pub fn get_record_by_index(&self, partition_name: &str, index: u128) -> Option<Record> {
         self.partitions
             .read()
             .expect("partition map read")
@@ -146,16 +154,20 @@ impl Topic {
 }
 
 impl Partition {
-    fn attach(root: PathBuf, topic: String, name: String, retain: Retention) -> Partition {
-        let path = Partition::state_path(&root, &name);
+    fn attach(root: PathBuf, topic: &str, name: &str, retain: Retention) -> Partition {
+        if !Path::exists(&root) {
+            fs::create_dir(&root).unwrap();
+        }
+        let path = Partition::state_path(&root, name);
         let state = PartitionState::attach(PathBuf::from(path));
-        let segment = state.get_active_segment(&name).unwrap_or(0);
-        let messages = Slog::attach(root.clone(), Partition::slog_name(&topic, &name), segment);
-        let open_index = state.open_index(&name);
+        let segment = state.get_active_segment(name).unwrap_or(0);
+        let messages = Slog::attach(root.clone(), Partition::slog_name(&topic, name), segment);
+        let open_index = state.open_index(name);
         Partition {
             state: Mutex::new(state),
             open_index,
-            name,
+            topic: String::from(topic),
+            name: String::from(name),
             messages,
             last_roll: Instant::now(),
             retain,
@@ -163,7 +175,8 @@ impl Partition {
     }
 
     fn state_path(root: &PathBuf, name: &str) -> PathBuf {
-        root.join(format!("{}-meta.sqlite", name))
+        let name = format!("{}-meta.sqlite", name);
+        root.join(name)
     }
 
     fn slog_name(topic: &str, name: &str) -> String {
@@ -242,11 +255,7 @@ impl Partition {
         self.messages.commit();
         if let Some(time) = self.messages.current_time_range() {
             // flush remaining messages
-            let start = self
-                .state
-                .lock()
-                .expect("partition state")
-                .open_index(&self.name);
+            let start = self.open_index;
             self.roll(start, time);
             self.messages.commit();
         }
@@ -256,6 +265,7 @@ impl Partition {
 mod test {
     use super::*;
     use parquet::data_type::ByteArray;
+    use std::ops::Deref;
     use std::sync::mpsc::channel;
     use std::thread;
     use tempfile::tempdir;
@@ -265,7 +275,7 @@ mod test {
         let dir = tempdir().unwrap();
         let root = PathBuf::from(dir.path());
         let mut t = Topic::attach(root, String::from("testing"), Retention::DEFAULT);
-        let p = String::from("default");
+        let p = "default";
 
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
@@ -276,17 +286,17 @@ mod test {
             .collect();
 
         for record in records.iter() {
-            t.append(&p, &vec![record.clone()]);
+            t.append(p, &vec![record.clone()]);
         }
 
         for (ix, record) in records.iter().enumerate() {
             assert_eq!(
-                t.get_record_by_index(&p, u128::try_from(ix).unwrap()),
+                t.get_record_by_index(p, u128::try_from(ix).unwrap()),
                 Some(record.clone())
             );
         }
         assert_eq!(
-            t.get_record_by_index(&p, u128::try_from(records.len()).unwrap()),
+            t.get_record_by_index(p, u128::try_from(records.len()).unwrap()),
             None
         );
     }
@@ -304,7 +314,7 @@ mod test {
                 max_duration: None,
             },
         );
-        let p = String::from("default");
+        let p = "default";
 
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
@@ -315,18 +325,18 @@ mod test {
             .collect();
 
         for record in records.iter() {
-            t.append(&p, &vec![record.clone()]);
+            t.append(p, &vec![record.clone()]);
         }
         t.commit();
 
         for (ix, record) in records.iter().enumerate() {
             assert_eq!(
-                t.get_record_by_index(&p, u128::try_from(ix).unwrap()),
+                t.get_record_by_index(p, u128::try_from(ix).unwrap()),
                 Some(record.clone())
             );
         }
         assert_eq!(
-            t.get_record_by_index(&p, u128::try_from(records.len()).unwrap()),
+            t.get_record_by_index(p, u128::try_from(records.len()).unwrap()),
             None
         );
     }
@@ -335,7 +345,7 @@ mod test {
     fn test_durability() {
         let dir = tempdir().unwrap();
         let root = PathBuf::from(dir.path());
-        let p = String::from("default");
+        let p = "default";
         let records: Vec<_> = vec!["abc", "def", "ghi", "jkl", "mno", "p"]
             .into_iter()
             .map(|message| Record {
@@ -355,7 +365,7 @@ mod test {
             );
 
             for record in records.iter() {
-                t.append(&p, &vec![record.clone()]);
+                t.append(p, &vec![record.clone()]);
             }
             t.commit();
         }
@@ -373,12 +383,12 @@ mod test {
 
             for (ix, record) in records.iter().enumerate() {
                 assert_eq!(
-                    t.get_record_by_index(&p, u128::try_from(ix).unwrap()),
+                    t.get_record_by_index(p, u128::try_from(ix).unwrap()),
                     Some(record.clone())
                 );
             }
             assert_eq!(
-                t.get_record_by_index(&p, u128::try_from(records.len()).unwrap()),
+                t.get_record_by_index(p, u128::try_from(records.len()).unwrap()),
                 None
             );
         }
