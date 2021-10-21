@@ -1,8 +1,9 @@
 use crate::segment::{Record, Segment, SegmentWriter};
+use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread::{spawn, JoinHandle};
 use std::time::{Duration, SystemTime};
 
@@ -17,7 +18,7 @@ pub(crate) struct Slog {
     writer: SlogThreadControl,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Index {
     pub segment: usize,
     pub record: usize,
@@ -119,26 +120,34 @@ enum SlogThreadMessage {
 struct SlogThreadControl {
     write_handle: JoinHandle<()>,
     ready: bool,
-    tx: mpsc::Sender<SlogThreadMessage>,
-    rx: mpsc::Receiver<()>,
+    tx: Mutex<mpsc::Sender<SlogThreadMessage>>,
+    rx: Mutex<mpsc::Receiver<()>>,
 }
 
 impl SlogThreadControl {
     fn try_send(&mut self, rs: Vec<Record>) -> bool {
         if !self.ready {
-            match self.rx.recv_timeout(Duration::from_millis(1000)) {
+            match self
+                .rx
+                .lock()
+                .expect("rx lock")
+                .recv_timeout(Duration::from_millis(1000))
+            {
                 Ok(()) => self.ready = true,
                 Err(_) => return false,
             }
         }
-        self.tx.send(SlogThreadMessage::Write(rs));
+        self.tx
+            .lock()
+            .expect("tx lock")
+            .send(SlogThreadMessage::Write(rs));
         self.ready = false;
         true
     }
 
     fn commit(&mut self) {
         if !self.ready {
-            self.rx.recv().unwrap();
+            self.rx.lock().expect("rx lock").recv().unwrap();
             self.ready = true;
         }
     }
@@ -146,7 +155,10 @@ impl SlogThreadControl {
 
 impl Drop for SlogThreadControl {
     fn drop(&mut self) {
-        self.tx.send(SlogThreadMessage::Close);
+        self.tx
+            .lock()
+            .expect("tx lock")
+            .send(SlogThreadMessage::Close);
     }
 }
 
@@ -174,8 +186,8 @@ impl SlogThread {
         SlogThreadControl {
             write_handle,
             ready: true,
-            tx,
-            rx,
+            tx: Mutex::new(tx),
+            rx: Mutex::new(rx),
         }
     }
 }

@@ -1,5 +1,6 @@
-use crate::segment::Record;
-use crate::slog::{Index, Slog};
+pub use crate::segment::Record;
+pub use crate::slog::Index;
+use crate::slog::Slog;
 use crate::topic_state::TopicState as PartitionState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,7 +8,7 @@ use std::convert::TryFrom;
 use std::fs;
 use std::ops::{RangeBounds, RangeInclusive};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,10 +21,10 @@ where
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Retention {
-    max_size: usize,
-    max_index: usize,
-    max_duration: Option<Duration>,
+pub struct Retention {
+    pub max_size: usize,
+    pub max_index: usize,
+    pub max_duration: Option<Duration>,
 }
 
 impl Retention {
@@ -34,7 +35,7 @@ impl Retention {
     };
 }
 
-struct Topic {
+pub struct Topic {
     root: PathBuf,
     name: String,
     state: RwLock<TopicState>,
@@ -48,7 +49,7 @@ struct Partition {
     open_index: u128,
     last_roll: Instant,
     retain: Retention,
-    state: PartitionState,
+    state: Mutex<PartitionState>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -57,7 +58,7 @@ struct TopicState {
 }
 
 impl Topic {
-    fn attach(root: PathBuf, name: String, retain: Retention) -> Self {
+    pub fn attach(root: PathBuf, name: String, retain: Retention) -> Self {
         let path = Topic::state_path(&root, &name);
         let state = if Path::exists(&path) {
             serde_json::from_reader(fs::File::open(path).unwrap()).unwrap()
@@ -92,7 +93,7 @@ impl Topic {
         root.join(format!("{}.json", name))
     }
 
-    fn append(&self, partition_name: &String, rs: &[Record]) -> Option<u128> {
+    pub fn append(&self, partition_name: &String, rs: &[Record]) -> Option<u128> {
         let partitions = self.partitions.read().expect("partition map read");
         if let Some(part) = partitions.get(partition_name) {
             part.write().expect("partition write").append(rs)
@@ -125,7 +126,7 @@ impl Topic {
         }
     }
 
-    fn get_record_by_index(&self, partition_name: &String, index: u128) -> Option<Record> {
+    pub fn get_record_by_index(&self, partition_name: &String, index: u128) -> Option<Record> {
         self.partitions
             .read()
             .expect("partition map read")
@@ -137,7 +138,7 @@ impl Topic {
             })
     }
 
-    fn commit(&self) {
+    pub fn commit(&self) {
         for (_, part) in self.partitions.read().expect("partition map read").iter() {
             part.write().expect("partition write").commit();
         }
@@ -152,7 +153,7 @@ impl Partition {
         let messages = Slog::attach(root.clone(), Partition::slog_name(&topic, &name), segment);
         let open_index = state.open_index(&name);
         Partition {
-            state,
+            state: Mutex::new(state),
             open_index,
             name,
             messages,
@@ -181,16 +182,17 @@ impl Partition {
 
     fn get_record_by_index(&self, index: u128) -> Option<Record> {
         let open = self.open_index;
+        let state = self.state.lock().expect("partition state");
         let slog_index = if index >= open {
             Some(Index {
                 record: usize::try_from(index - open).unwrap(),
-                segment: self.state.get_active_segment(&self.name).unwrap_or(0),
+                segment: state.get_active_segment(&self.name).unwrap_or(0),
             })
         } else {
-            self.state
+            state
                 .get_segment_for_ix(&self.name, u64::try_from(index).unwrap())
                 .map(|segment| {
-                    let span = self.state.get_segment_span(&self.name, segment).unwrap();
+                    let span = state.get_segment_span(&self.name, segment).unwrap();
                     Index {
                         record: usize::try_from(index - span.index.start).unwrap(),
                         segment,
@@ -207,8 +209,11 @@ impl Partition {
             time,
             index: start..start + size,
         };
-        self.state
-            .update(&self.name, self.messages.current_segment_ix(), &span);
+        self.state.lock().expect("partition state").update(
+            &self.name,
+            self.messages.current_segment_ix(),
+            &span,
+        );
         self.last_roll = Instant::now();
         self.open_index = span.index.end;
         self.messages.roll();
@@ -237,7 +242,11 @@ impl Partition {
         self.messages.commit();
         if let Some(time) = self.messages.current_time_range() {
             // flush remaining messages
-            let start = self.state.open_index(&self.name);
+            let start = self
+                .state
+                .lock()
+                .expect("partition state")
+                .open_index(&self.name);
             self.roll(start, time);
             self.messages.commit();
         }

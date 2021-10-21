@@ -10,10 +10,10 @@ parquet = "5.5"
 rusqlite = { version = "0.26", features = ["time"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.2"
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
 warp = "0.3"
 
 [dev-dependencies]
 itermore = "0.1"
-tempfile = "3.2"
