@@ -12,12 +12,13 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SegmentSpan<R>
+pub struct SegmentData<R>
 where
     R: Clone + RangeBounds<u128>,
 {
     pub time: RangeInclusive<SystemTime>,
     pub index: R,
+    pub size: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,8 +41,7 @@ impl Default for Rolling {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Retention {
     pub max_segment_count: Option<usize>,
-    pub max_bytes: usize,
-    pub max_segment_age: Option<Duration>,
+    pub max_bytes: u64,
 }
 
 impl Default for Retention {
@@ -49,7 +49,6 @@ impl Default for Retention {
         Retention {
             max_segment_count: Some(10000),
             max_bytes: 1 * 1024 * 1024 * 1024,
-            max_segment_age: None,
         }
     }
 }
@@ -242,19 +241,24 @@ impl Partition {
     }
 
     fn roll(&mut self, start: u128, time: RangeInclusive<SystemTime>) {
-        let size = u128::try_from(self.messages.current_len()).unwrap();
-        let span = SegmentSpan {
-            time,
-            index: start..start + size,
-        };
-        self.state.lock().expect("partition state").update(
-            &self.name,
-            self.messages.current_segment_ix(),
-            &span,
-        );
-        self.last_roll = Instant::now();
-        self.open_index = span.index.end;
-        self.messages.roll();
+        let current_segment_ix = self.messages.current_segment_ix();
+        let last_segment_record_ix = u128::try_from(self.messages.current_len()).unwrap();
+        {
+            let state = self.state.lock().expect("partition state");
+            self.messages
+                .roll()
+                .map(|(ix, size)| state.update_size(&self.name, ix, size));
+
+            let span = SegmentData {
+                time,
+                index: start..start + last_segment_record_ix,
+                size: None,
+            };
+            state.update(&self.name, current_segment_ix, &span);
+            self.last_roll = Instant::now();
+            self.open_index = span.index.end;
+        }
+        self.retain();
     }
 
     fn roll_when_needed(&mut self, start: u128) {
@@ -276,14 +280,51 @@ impl Partition {
         }
     }
 
+    fn over_retention_limit(&self) -> bool {
+        let state = self.state.lock().expect("partition state");
+        let retain = &self.config.retain;
+
+        if state.get_size(&self.name).unwrap_or(0) > retain.max_bytes {
+            return true;
+        }
+
+        // TODO validate
+        if let Some(count) = retain.max_segment_count {
+            return state.get_active_segment(&self.name).unwrap_or(0)
+                - state.get_min_segment(&self.name).unwrap_or(0)
+                > count;
+        }
+
+        false
+    }
+
+    fn retain(&self) {
+        while self.over_retention_limit() {
+            let state = self.state.lock().expect("partition state");
+            state.get_min_segment(&self.name).map(|ix| {
+                // TODO ensure we handle failure if this call
+                self.messages.destroy(ix);
+                // succeeds but this does not complete e.g. due to node shutdown
+                state.remove_segment(&self.name, ix)
+            });
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        let state = self.state.lock().expect("partition state");
+        self.messages
+            .commit()
+            .map(|(ix, size)| state.update_size(&self.name, ix, size));
+    }
+
     fn commit(&mut self) {
         // await completion of any pending write
-        self.messages.commit();
+        self.flush_pending();
         if let Some(time) = self.messages.current_time_range() {
             // flush remaining messages
             let start = self.open_index;
             self.roll(start, time);
-            self.messages.commit();
+            self.flush_pending();
         }
     }
 }
@@ -443,7 +484,17 @@ mod test {
             let thread_root = root.clone();
             let p = format!("part-{}", part);
             let handle = thread::spawn(move || {
-                let mut t = Topic::attach(thread_root, String::from("testing"), Config::default());
+                let mut t = Topic::attach(
+                    thread_root,
+                    String::from("testing"),
+                    Config {
+                        retain: Retention {
+                            max_bytes: 500 * 1024 * 1024,
+                            ..Retention::default()
+                        },
+                        ..Config::default()
+                    },
+                );
 
                 let seed = 0..sample;
                 let records: Vec<_> = seed

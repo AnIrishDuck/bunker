@@ -1,6 +1,7 @@
 use crate::segment::{Record, Segment, SegmentWriter};
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, min};
+use std::fs;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{mpsc, Mutex};
@@ -38,9 +39,13 @@ impl Slog {
         }
     }
 
-    pub(crate) fn segment_from_name(root: &PathBuf, name: &str, segment_ix: usize) -> Segment {
+    fn segment_path(root: &PathBuf, name: &str, segment_ix: usize) -> PathBuf {
         let file = PathBuf::from(format!("{}-{}", name, segment_ix));
-        Segment::at(root.join(file))
+        root.join(file)
+    }
+
+    pub(crate) fn segment_from_name(root: &PathBuf, name: &str, segment_ix: usize) -> Segment {
+        Segment::at(Slog::segment_path(root, name, segment_ix))
     }
 
     pub(crate) fn get_segment(&self, segment_ix: usize) -> Segment {
@@ -75,6 +80,10 @@ impl Slog {
         }
     }
 
+    pub(crate) fn destroy(&self, segment_ix: usize) {
+        fs::remove_file(Slog::segment_path(&self.root, &self.name, segment_ix)).unwrap()
+    }
+
     pub(crate) fn current_segment_ix(&self) -> usize {
         self.current
     }
@@ -91,20 +100,22 @@ impl Slog {
         self.time_range.clone()
     }
 
-    pub(crate) fn roll(&mut self) -> () {
-        if !self
+    pub(crate) fn roll(&mut self) -> Option<(usize, u64)> {
+        let (ready, data) = self
             .writer
-            .try_send(std::mem::replace(&mut self.pending, vec![]))
-        {
+            .try_send(std::mem::replace(&mut self.pending, vec![]));
+        if ready {
+            self.pending_size = 0;
+            self.time_range = None;
+            self.current += 1;
+            data
+        } else {
             panic!("log overrun")
         }
-        self.pending_size = 0;
-        self.time_range = None;
-        self.current += 1;
     }
 
-    pub(crate) fn commit(&mut self) {
-        self.writer.commit();
+    pub(crate) fn commit(&mut self) -> Option<(usize, u64)> {
+        self.writer.commit()
     }
 }
 
@@ -121,11 +132,12 @@ struct SlogThreadControl {
     write_handle: JoinHandle<()>,
     ready: bool,
     tx: Mutex<mpsc::Sender<SlogThreadMessage>>,
-    rx: Mutex<mpsc::Receiver<()>>,
+    rx: Mutex<mpsc::Receiver<(usize, u64)>>,
 }
 
 impl SlogThreadControl {
-    fn try_send(&mut self, rs: Vec<Record>) -> bool {
+    fn try_send(&mut self, rs: Vec<Record>) -> (bool, Option<(usize, u64)>) {
+        let mut size_data = None;
         if !self.ready {
             match self
                 .rx
@@ -133,8 +145,11 @@ impl SlogThreadControl {
                 .expect("rx lock")
                 .recv_timeout(Duration::from_millis(1000))
             {
-                Ok(()) => self.ready = true,
-                Err(_) => return false,
+                Ok(data) => {
+                    self.ready = true;
+                    size_data = Some(data)
+                }
+                Err(_) => return (false, None),
             }
         }
         self.tx
@@ -142,13 +157,16 @@ impl SlogThreadControl {
             .expect("tx lock")
             .send(SlogThreadMessage::Write(rs));
         self.ready = false;
-        true
+        (true, size_data)
     }
 
-    fn commit(&mut self) {
+    fn commit(&mut self) -> Option<(usize, u64)> {
         if !self.ready {
-            self.rx.lock().expect("rx lock").recv().unwrap();
+            let data = self.rx.lock().expect("rx lock").recv().unwrap();
             self.ready = true;
+            Some(data)
+        } else {
+            None
         }
     }
 }
@@ -174,8 +192,8 @@ impl SlogThread {
                 match rx_records.recv().unwrap() {
                     SlogThreadMessage::Write(rs) => {
                         segment.log(rs);
-                        segment.close();
-                        tx_done.send(()).unwrap();
+                        let size = segment.close();
+                        tx_done.send((current, size)).unwrap();
                         current += 1;
                     }
                     SlogThreadMessage::Close => active = false,

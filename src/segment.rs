@@ -111,9 +111,10 @@ impl SegmentWriter {
         self.file.sync_data()
     }
 
-    pub(crate) fn close(mut self) {
+    pub(crate) fn close(mut self) -> u64 {
         self.writer.close().unwrap();
         self.sync().unwrap();
+        fs::metadata(self.path).unwrap().len()
     }
 }
 
