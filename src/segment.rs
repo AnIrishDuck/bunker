@@ -106,14 +106,9 @@ impl SegmentWriter {
         self.writer.close_row_group(row_group_writer).unwrap();
     }
 
-    pub(crate) fn sync(&mut self) -> io::Result<()> {
-        // TODO: validate there's no stored data within the SerializedFileWriter that needs to be flushed
-        self.file.sync_data()
-    }
-
     pub(crate) fn close(mut self) -> u64 {
         self.writer.close().unwrap();
-        self.sync().unwrap();
+        self.file.sync_data().unwrap();
         fs::metadata(self.path).unwrap().len()
     }
 }
@@ -202,7 +197,6 @@ mod test {
         let mut w = s.create();
         for r in records.iter() {
             w.log(vec![r.clone()]);
-            w.sync().unwrap();
         }
         w.close();
 
