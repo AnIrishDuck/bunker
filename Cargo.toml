@@ -1,5 +1,5 @@
 [package]
-name = "bunker"
+name = "plateau"
 edition = "2018"
 version = "0.1.0"
 authors = ["Frank Murphy <fmurphy@instructure.com>"]
